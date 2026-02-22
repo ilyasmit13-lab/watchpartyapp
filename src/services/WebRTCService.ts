@@ -1,16 +1,6 @@
 import { EventEmitter } from 'events';
-import { auth, db } from './firebaseConfig';
-import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import {
-    doc, setDoc, getDoc, onSnapshot, collection, addDoc, query, orderBy, limit, updateDoc, serverTimestamp, deleteDoc, getDocs, where
-} from 'firebase/firestore';
-import {
-    RTCPeerConnection,
-    RTCIceCandidate,
-    RTCSessionDescription,
-    mediaDevices,
-    MediaStream,
-} from 'react-native-webrtc';
+import { io, Socket } from 'socket.io-client';
+import { Platform } from 'react-native';
 
 const configuration = {
     iceServers: [
@@ -19,36 +9,129 @@ const configuration = {
     ],
 };
 
+const DEFAULT_BACKEND_URL = Platform.OS === 'android' ? 'http://10.0.2.2:3000' : 'http://localhost:3000';
+
+const generateUserId = () => `u_${Math.random().toString(36).slice(2, 10)}`;
+
+interface Participant {
+    userId: string;
+    userName?: string;
+    isHost?: boolean;
+}
+
 export class WebRTCService extends EventEmitter {
-    public userId: string | null = null;
+    private webrtc: any = null;
+    private socket: Socket | null = null;
+    public isNativeModuleAvailable: boolean = false;
+    public userId: string = generateUserId();
+    public userName: string = 'Guest';
     public partyId: string | null = null;
     public isConnected: boolean = false;
-    public localStream: MediaStream | null = null;
-    public peers: { [userId: string]: RTCPeerConnection } = {};
-    public remoteStreams: { [userId: string]: MediaStream } = {};
-
-    private unsubParty: (() => void) | null = null;
-    private unsubChat: (() => void) | null = null;
-    private unsubSignals: (() => void) | null = null;
-    private unsubParticipants: (() => void) | null = null;
+    public localStream: any = null;
+    public peers: { [userId: string]: any } = {};
+    public remoteStreams: { [userId: string]: any } = {};
+    public isHost: boolean = false;
 
     constructor() {
         super();
-        onAuthStateChanged(auth, (user) => {
-            if (user) this.userId = user.uid;
+        try {
+            this.webrtc = require('react-native-webrtc');
+            this.isNativeModuleAvailable = !!this.webrtc?.RTCPeerConnection;
+        } catch {
+            this.webrtc = null;
+            this.isNativeModuleAvailable = false;
+        }
+    }
+
+    isSupported() {
+        return this.isNativeModuleAvailable;
+    }
+
+    private getBackendUrl() {
+        return process.env.EXPO_PUBLIC_BACKEND_URL || DEFAULT_BACKEND_URL;
+    }
+
+    private ensureSocket() {
+        if (this.socket) return;
+        this.socket = io(this.getBackendUrl(), {
+            transports: ['websocket'],
+            timeout: 10000,
+            reconnection: true,
+            reconnectionAttempts: 10,
+        });
+
+        this.socket.on('connect', () => {
+            this.emit('connected');
+        });
+
+        this.socket.on('disconnect', () => {
+            this.isConnected = false;
+            this.emit('disconnected');
+        });
+
+        this.socket.on('sync_state', (state: any) => {
+            this.isHost = state?.hostId === this.userId;
+            this.emit('sync_state', state);
+            this.emit('role_update', { isHost: this.isHost, hostId: state?.hostId });
+        });
+
+        this.socket.on('chat_history', (history: any[]) => {
+            this.emit('chat_history', history || []);
+        });
+
+        this.socket.on('chat_message', (msg: any) => {
+            this.emit('chat_message', msg);
+        });
+
+        this.socket.on('typing_start', (payload: any) => {
+            this.emit('typing_start', payload);
+        });
+
+        this.socket.on('typing_stop', (payload: any) => {
+            this.emit('typing_stop', payload);
+        });
+
+        this.socket.on('participants_list', (participants: Participant[]) => {
+            const list = participants || [];
+            this.isHost = !!list.find((p) => p.userId === this.userId && p.isHost);
+            this.emit('participants_list', list);
+            this.emit('role_update', { isHost: this.isHost, hostId: list.find((p) => p.isHost)?.userId || null });
+
+            list.forEach((p) => {
+                if (p.userId !== this.userId && !this.peers[p.userId]) {
+                    const shouldInitiate = this.userId < p.userId;
+                    if (shouldInitiate) {
+                        this.createPeerConnection(p.userId, true);
+                    }
+                }
+            });
+        });
+
+        this.socket.on('webrtc_offer', async ({ sdp, senderId }: any) => {
+            await this.handleSignal({ type: 'offer', data: { sdp }, senderId });
+        });
+
+        this.socket.on('webrtc_answer', async ({ sdp, senderId }: any) => {
+            await this.handleSignal({ type: 'answer', data: { sdp }, senderId });
+        });
+
+        this.socket.on('webrtc_ice_candidate', async ({ candidate, senderId }: any) => {
+            await this.handleSignal({ type: 'candidate', data: { candidate }, senderId });
         });
     }
 
     async getLocalStream() {
+        if (!this.isNativeModuleAvailable || !this.webrtc?.mediaDevices) return null;
         if (this.localStream) return this.localStream;
+
         try {
-            const stream = await mediaDevices.getUserMedia({
+            const stream = await this.webrtc.mediaDevices.getUserMedia({
                 audio: true,
                 video: {
                     width: 640,
                     height: 480,
                     frameRate: 30,
-                    facingMode: 'user', // Front camera
+                    facingMode: 'user',
                 },
             });
             this.localStream = stream;
@@ -60,97 +143,48 @@ export class WebRTCService extends EventEmitter {
         }
     }
 
-    async connect(partyId: string, contentUrl?: string) {
+    async connect(partyId: string, contentUrl?: string, userName?: string) {
         if (this.isConnected && this.partyId === partyId) return;
+
         this.partyId = partyId;
-        
-        if (!auth.currentUser) await signInAnonymously(auth);
-        
-        // Ensure local stream is ready before joining fully
+        this.userName = userName?.trim() || this.userName;
+        this.ensureSocket();
+
         await this.getLocalStream();
 
-        await this.ensurePartyExists(partyId, contentUrl);
-
-        // 1. Listen to Party State (Sync)
-        this.unsubParty = onSnapshot(doc(db, 'parties', partyId), (snap) => {
-            if (snap.exists()) this.emit('sync_state', snap.data());
-        });
-
-        // 2. Listen to Chat
-        const chatQ = query(collection(db, 'parties', partyId, 'messages'), orderBy('createdAt', 'asc'), limit(50));
-        let initialChat = true;
-        this.unsubChat = onSnapshot(chatQ, (snap) => {
-            if (initialChat) {
-                this.emit('chat_history', snap.docs.map(d => d.data()));
-                initialChat = false;
-            } else {
-                snap.docChanges().forEach(c => {
-                    if (c.type === 'added') this.emit('chat_message', c.doc.data());
-                });
-            }
-        });
-
-        // 3. Join Presence & Listen to Participants
-        await this.participantJoin();
-
-        // 4. Listen to Signals (Handshake)
-        const signalsRef = collection(db, 'parties', partyId, 'signals');
-        const qSignals = query(signalsRef, where('targetId', '==', this.userId));
-        this.unsubSignals = onSnapshot(qSignals, (snap) => {
-            snap.docChanges().forEach(async (change) => {
-                if (change.type === 'added') {
-                    const data = change.doc.data();
-                    await this.handleSignal(data, change.doc.id);
-                }
-            });
+        this.socket?.emit('join_party', {
+            partyId,
+            userId: this.userId,
+            userName: this.userName,
+            contentUrl: contentUrl || '',
         });
 
         this.isConnected = true;
-        this.emit('connected');
-    }
-
-    async participantJoin() {
-        if (!this.partyId || !this.userId) return;
-        const userRef = doc(db, 'parties', this.partyId, 'participants', this.userId);
-        await setDoc(userRef, { userId: this.userId, joinedAt: serverTimestamp(), lastActive: serverTimestamp() });
-
-        this.unsubParticipants = onSnapshot(collection(db, 'parties', this.partyId, 'participants'), (snap) => {
-            const participants = snap.docs.map(d => d.data());
-            this.emit('participants_list', participants);
-            
-            // Initiate connection to others if I am "new" (or just connect disjoint sets)
-            // Simplified Mesh: If I see a participant with ID < my ID, I offer. (Or any stable tie-breaker)
-            // Better: New joiner offers to existing. But simplest is just consistent logic:
-            // Let's rely on the fact that existing participants are already there.
-            // We iterate and connect to anyone we don't have a peer for.
-            participants.forEach(p => {
-                if (p.userId !== this.userId && !this.peers[p.userId]) {
-                    this.createPeerConnection(p.userId, true); // Initiator logic could be refined
-                }
-            });
-        });
     }
 
     async createPeerConnection(targetUserId: string, isInitiator: boolean) {
+        if (!this.isNativeModuleAvailable || !this.webrtc?.RTCPeerConnection) return;
         if (this.peers[targetUserId]) return;
 
-        const pc = new RTCPeerConnection(configuration);
+        const pc = new this.webrtc.RTCPeerConnection(configuration);
         this.peers[targetUserId] = pc;
 
-        // Add local tracks
         if (this.localStream) {
-            this.localStream.getTracks().forEach(track => {
-                pc.addTrack(track, this.localStream!);
+            this.localStream.getTracks().forEach((track: any) => {
+                pc.addTrack(track, this.localStream);
             });
         }
 
-        pc.onicecandidate = async (event) => {
-            if (event.candidate) {
-                await this.sendSignal(targetUserId, 'candidate', { candidate: event.candidate });
-            }
+        pc.onicecandidate = async (event: any) => {
+            if (!event.candidate || !this.partyId) return;
+            this.socket?.emit('webrtc_ice_candidate', {
+                partyId: this.partyId,
+                targetUserId,
+                candidate: event.candidate,
+            });
         };
 
-        pc.ontrack = (event) => {
+        pc.ontrack = (event: any) => {
             if (event.streams && event.streams[0]) {
                 this.remoteStreams[targetUserId] = event.streams[0];
                 this.emit('remote_stream', { userId: targetUserId, stream: event.streams[0] });
@@ -158,49 +192,91 @@ export class WebRTCService extends EventEmitter {
         };
 
         pc.onconnectionstatechange = () => {
-            if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-               this.cleanupPeer(targetUserId);
+            if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+                this.cleanupPeer(targetUserId);
             }
         };
 
-        if (isInitiator) {
+        if (isInitiator && this.partyId) {
             const offer = await pc.createOffer({});
             await pc.setLocalDescription(offer);
-            await this.sendSignal(targetUserId, 'offer', { sdp: offer });
+            this.socket?.emit('webrtc_offer', {
+                partyId: this.partyId,
+                targetUserId,
+                sdp: offer,
+            });
         }
     }
 
-    async handleSignal(signal: any, docId: string) {
+    async handleSignal(signal: any) {
+        if (!this.isNativeModuleAvailable || !this.webrtc) return;
         const { type, data, senderId } = signal;
+        if (!senderId) return;
+
         if (!this.peers[senderId]) {
             await this.createPeerConnection(senderId, false);
         }
         const pc = this.peers[senderId];
+        if (!pc) return;
 
         try {
             if (type === 'offer') {
-                await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+                await pc.setRemoteDescription(new this.webrtc.RTCSessionDescription(data.sdp));
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                await this.sendSignal(senderId, 'answer', { sdp: answer });
-            } else if (type === 'answer') {
-                await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-            } else if (type === 'candidate') {
-                if (data.candidate) {
-                    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                if (this.partyId) {
+                    this.socket?.emit('webrtc_answer', {
+                        partyId: this.partyId,
+                        targetUserId: senderId,
+                        sdp: answer,
+                    });
                 }
+            } else if (type === 'answer') {
+                await pc.setRemoteDescription(new this.webrtc.RTCSessionDescription(data.sdp));
+            } else if (type === 'candidate' && data.candidate) {
+                await pc.addIceCandidate(new this.webrtc.RTCIceCandidate(data.candidate));
             }
-            // Delete signal after processing to keep DB clean
-             await deleteDoc(doc(db, 'parties', this.partyId!, 'signals', docId));
         } catch (e) {
             console.error('Signaling handling error', e);
         }
     }
 
-    async sendSignal(targetId: string, type: string, data: any) {
-        if (!this.partyId || !this.userId) return;
-        await addDoc(collection(db, 'parties', this.partyId, 'signals'), {
-            type, targetId, senderId: this.userId, data, createdAt: serverTimestamp()
+    async sendChatMessage(text: string) {
+        if (!this.partyId || !text.trim()) return;
+        this.socket?.emit('chat_message', {
+            partyId: this.partyId,
+            userId: this.userId,
+            userName: this.userName,
+            text,
+        });
+    }
+
+    startTyping() {
+        if (!this.partyId) return;
+        this.socket?.emit('typing_start', {
+            partyId: this.partyId,
+            userId: this.userId,
+            userName: this.userName,
+        });
+    }
+
+    stopTyping() {
+        if (!this.partyId) return;
+        this.socket?.emit('typing_stop', {
+            partyId: this.partyId,
+            userId: this.userId,
+            userName: this.userName,
+        });
+    }
+
+    async updatePlaybackState(isPlaying: boolean, positionMs: number, contentUrl?: string) {
+        if (!this.partyId) return;
+        this.socket?.emit('update_playback', {
+            partyId: this.partyId,
+            userId: this.userId,
+            isPlaying,
+            positionMs,
+            contentUrl: contentUrl || undefined,
         });
     }
 
@@ -214,51 +290,24 @@ export class WebRTCService extends EventEmitter {
         }
         this.emit('participant_left', userId);
     }
-    
-    // -- Chat & Sync Helpers --
-
-    async ensurePartyExists(partyId: string, contentUrl?: string) {
-        const partyRef = doc(db, 'parties', partyId);
-        const snapshot = await getDoc(partyRef);
-        if (!snapshot.exists()) {
-            await setDoc(partyRef, { 
-                id: partyId, isPlaying: false, positionMs: 0, 
-                contentUrl: contentUrl || '', lastUpdate: serverTimestamp() 
-            });
-        }
-    }
-
-    async sendChatMessage(text: string) {
-        if (!this.partyId || !this.userId) return;
-        await addDoc(collection(db, 'parties', this.partyId, 'messages'), {
-            partyId: this.partyId, user_id: this.userId, text, createdAt: serverTimestamp()
-        });
-    }
-
-    async updatePlaybackState(isPlaying: boolean, positionMs: number) {
-        if (!this.partyId) return;
-        await updateDoc(doc(db, 'parties', this.partyId), { isPlaying, positionMs, lastUpdate: serverTimestamp() });
-    }
 
     async leave() {
         if (this.localStream) {
-            this.localStream.getTracks().forEach(t => t.stop());
+            this.localStream.getTracks().forEach((t: any) => t.stop());
             this.localStream = null;
         }
-        Object.keys(this.peers).forEach(uid => this.cleanupPeer(uid));
-        
-        if (this.partyId && this.userId) {
-             const userRef = doc(db, 'parties', this.partyId, 'participants', this.userId);
-             await deleteDoc(userRef);
+
+        Object.keys(this.peers).forEach((uid) => this.cleanupPeer(uid));
+
+        if (this.partyId) {
+            this.socket?.emit('leave_party', {
+                partyId: this.partyId,
+                userId: this.userId,
+            });
         }
 
-        if (this.unsubParty) this.unsubParty();
-        if (this.unsubChat) this.unsubChat();
-        if (this.unsubSignals) this.unsubSignals();
-        if (this.unsubParticipants) this.unsubParticipants();
-        
+        this.partyId = null;
         this.isConnected = false;
-        this.emit('disconnected');
     }
 }
 

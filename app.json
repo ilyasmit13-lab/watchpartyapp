@@ -2,7 +2,12 @@
   "expo": {
     "name": "WatchPartyApp",
     "slug": "WatchPartyApp",
+    "scheme": "enlyn",
     "version": "1.0.0",
+    "platforms": [
+      "ios",
+      "android"
+    ],
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -19,7 +24,7 @@
         "NSMicrophoneUsageDescription": "Allow $(PRODUCT_NAME) to access your microphone"
       },
       "bitcode": false,
-      "bundleIdentifier": "com.anonymous.WatchPartyApp"
+      "bundleIdentifier": "com.ilyasn.watchpartyapp"
     },
     "android": {
       "adaptiveIcon": {
@@ -38,9 +43,6 @@
         "android.permission.WAKE_LOCK",
         "android.permission.BLUETOOTH"
       ]
-    },
-    "web": {
-      "favicon": "./assets/favicon.png"
     },
     "plugins": [
       [

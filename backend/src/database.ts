@@ -2,10 +2,11 @@ import sqlite3 from 'sqlite3';
 import { open, Database } from 'sqlite';
 
 let db: Database;
+const DB_PATH = process.env.DB_PATH || './database.sqlite';
 
 export async function initDb() {
     db = await open({
-        filename: './database.sqlite',
+        filename: DB_PATH,
         driver: sqlite3.Database
     });
 
@@ -18,6 +19,7 @@ export async function initDb() {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             party_id TEXT,
             user_id TEXT,
+            user_name TEXT,
             text TEXT,
             created_at INTEGER
         );
@@ -26,13 +28,18 @@ export async function initDb() {
              push_token TEXT
         );
     `);
-    console.log('[DB] Initialized');
+    try {
+        await db.exec(`ALTER TABLE messages ADD COLUMN user_name TEXT;`);
+    } catch {
+        // Column already exists on upgraded databases.
+    }
+    console.log(`[DB] Initialized at ${DB_PATH}`);
 }
 
-export async function saveMessage(partyId: string, userId: string, text: string) {
+export async function saveMessage(partyId: string, userId: string, userName: string, text: string) {
     const result = await db.run(
-        'INSERT INTO messages (party_id, user_id, text, created_at) VALUES (?, ?, ?, ?)',
-        partyId, userId, text, Date.now()
+        'INSERT INTO messages (party_id, user_id, user_name, text, created_at) VALUES (?, ?, ?, ?, ?)',
+        partyId, userId, userName, text, Date.now()
     );
     return result.lastID;
 }

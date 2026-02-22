@@ -1,15 +1,15 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { View, Text, StyleSheet, Dimensions, TouchableOpacity, SafeAreaView, TextInput, ScrollView, Modal, Platform } from 'react-native';
+import { View, Text, StyleSheet, Dimensions, TouchableOpacity, SafeAreaView, TextInput, ScrollView, Modal, Platform, Share } from 'react-native';
 import { Video, ResizeMode } from 'expo-av';
 import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import Slider from '@react-native-community/slider';
 import * as ScreenOrientation from 'expo-screen-orientation';
 import { WebView } from 'react-native-webview';
+import Constants from 'expo-constants';
 
 import { contentProviders } from '../providers/ContentProvider';
 import { InjectedPlayer } from '../components/InjectedPlayer';
 import { webRTCService } from '../services/WebRTCService';
-import { RTCView } from 'react-native-webrtc';
 import { useCameraPermissions } from 'expo-camera';
 
 const { width, height } = Dimensions.get('window');
@@ -21,8 +21,9 @@ const formatTime = (seconds: number) => {
 };
 
 export const PartyRoomScreen = ({ route, navigation }: any) => {
-    const { partyId, contentUrl } = route.params || {};
+    const { partyId, contentUrl, userName = 'Guest' } = route.params || {};
     const safeUrl = contentUrl || 'https://www.youtube.com'; // Default to homepage if empty
+    const isExpoGo = Constants.appOwnership === 'expo';
 
     // Player State
     const [isPlaying, setIsPlaying] = useState(false);
@@ -33,8 +34,12 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
 
     // UI State
     const [showControls, setShowControls] = useState(true);
+    const [isHost, setIsHost] = useState(false);
     const [isChatOpen, setIsChatOpen] = useState(false);
     const [messageText, setMessageText] = useState('');
+    const [isTyping, setIsTyping] = useState(false);
+    const [typingUsers, setTypingUsers] = useState<Record<string, string>>({});
+    const [unreadCount, setUnreadCount] = useState(0);
     const [messages, setMessages] = useState<{ user: string, text: string }[]>([
         { user: 'System', text: `Welcome to Party ${partyId || 'Test'}` }
     ]);
@@ -43,6 +48,13 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
     const [permission, requestPermission] = useCameraPermissions();
     const [localStream, setLocalStream] = useState<any>(null);
     const [remoteStreams, setRemoteStreams] = useState<{ [userId: string]: any }>({});
+    const [RTCViewComponent, setRTCViewComponent] = useState<any>(null);
+    const [webrtcSupported, setWebrtcSupported] = useState(false);
+    const lastPlaybackSyncRef = useRef(0);
+    const currentTimeRef = useRef(0);
+    const typingStopTimeoutRef = useRef<any>(null);
+    const twitchWebViewRef = useRef<WebView>(null);
+    const twitchReloadGuardRef = useRef(0);
 
     // Determine Source
     const [playerSource] = useState<any>(() => {
@@ -107,17 +119,46 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
     const [participants, setParticipants] = useState<any[]>([]);
 
     useEffect(() => {
-        // Permissions
-        (async () => {
-            if (!permission || !permission.granted) {
-                await requestPermission();
-            }
-        })();
+        currentTimeRef.current = currentTime;
+    }, [currentTime]);
 
-        // Connect
-        if (partyId) {
-            webRTCService.connect(partyId, contentUrl);
+    useEffect(() => {
+        if (isExpoGo || !webRTCService.isSupported()) {
+            setWebrtcSupported(false);
+            return;
         }
+        try {
+            const mod = require('react-native-webrtc');
+            setRTCViewComponent(() => mod.RTCView);
+            setWebrtcSupported(!!mod.RTCView);
+        } catch {
+            setRTCViewComponent(null);
+            setWebrtcSupported(false);
+        }
+    }, [isExpoGo]);
+
+    useEffect(() => {
+        let isMounted = true;
+
+        const init = async () => {
+            // Ensure permission is granted before attempting local media.
+            if (webrtcSupported) {
+                const granted = permission?.granted ? true : (await requestPermission())?.granted;
+                if (!granted) return;
+            }
+
+            if (partyId) {
+                await webRTCService.connect(partyId, contentUrl, userName);
+            }
+
+            // Retry local stream acquisition after permissions settle.
+            const stream = await webRTCService.getLocalStream();
+            if (isMounted && stream) {
+                setLocalStream(stream);
+            }
+        };
+
+        init();
         
         // Listeners for streams
         const handleLocal = (stream: any) => setLocalStream(stream);
@@ -137,23 +178,28 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
         webRTCService.on('participant_left', handleLeft);
 
         return () => {
+             isMounted = false;
              webRTCService.leave(); 
              webRTCService.off('local_stream', handleLocal);
              webRTCService.off('remote_stream', handleRemote);
              webRTCService.off('participant_left', handleLeft);
         };
-    }, [partyId]);
+    }, [partyId, webrtcSupported, contentUrl, userName]);
 
     // Notifications & Presence & Sync
     useEffect(() => {
         const handleChatMsg = (msg: any) => {
-            const displayUser = msg.user_id === 'me' || msg.user_id === webRTCService.userId ? 'Me' : 'User ' + (msg.user_id ? msg.user_id.substr(0, 4) : 'Unknown');
+            const isMe = msg.user_id === webRTCService.userId;
+            const displayUser = isMe ? 'Me' : (msg.userName || msg.user_name || (msg.user_id ? `User ${msg.user_id.substr(0, 4)}` : 'Unknown'));
             setMessages(prev => [...prev, { user: displayUser, text: msg.text }]);
+            if (!isChatOpen && !isMe) {
+                setUnreadCount((prev) => prev + 1);
+            }
         };
 
         const handleHistory = (history: any[]) => {
             const formatted = history.map(h => ({
-                user: h.user_id === 'me' || h.user_id === webRTCService.userId ? 'Me' : 'User ' + (h.user_id ? h.user_id.substr(0, 4) : 'Unknown'),
+                user: h.user_id === webRTCService.userId ? 'Me' : (h.userName || h.user_name || (h.user_id ? `User ${h.user_id.substr(0, 4)}` : 'Unknown')),
                 text: h.text
             }));
             setMessages(prev => [...prev, ...formatted]);
@@ -168,26 +214,60 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
             if (state.contentUrl && state.contentUrl !== contentUrl) {
                 // If content differs, reload the PartyRoom with new URL
                 // We use replace to avoid stacking
-                navigation.replace('PartyRoom', { partyId, contentUrl: state.contentUrl });
+                navigation.replace('PartyRoom', { partyId, contentUrl: state.contentUrl, userName });
             }
             if (state.isPlaying !== undefined) setIsPlaying(state.isPlaying);
             if (state.positionMs !== undefined) {
-                // ideally seek here if delta is large
+                const remoteSeconds = Number(state.positionMs || 0) / 1000;
+                if (Math.abs(remoteSeconds - currentTimeRef.current) > 2) {
+                    setSeekingVal(remoteSeconds);
+                    setCurrentTime(remoteSeconds);
+                }
             }
+        };
+
+        const handleRoleUpdate = ({ isHost: host }: any) => {
+            setIsHost(!!host);
+        };
+
+        const handleTypingStart = ({ userId, userName: typingName }: any) => {
+            if (!userId || userId === webRTCService.userId) return;
+            setTypingUsers((prev) => ({ ...prev, [userId]: typingName || `User ${String(userId).slice(0, 4)}` }));
+        };
+
+        const handleTypingStop = ({ userId }: any) => {
+            if (!userId) return;
+            setTypingUsers((prev) => {
+                const copy = { ...prev };
+                delete copy[userId];
+                return copy;
+            });
         };
 
         webRTCService.on('chat_message', handleChatMsg);
         webRTCService.on('chat_history', handleHistory);
         webRTCService.on('participants_list', handleParticipants);
         webRTCService.on('sync_state', handleSync);
+        webRTCService.on('role_update', handleRoleUpdate);
+        webRTCService.on('typing_start', handleTypingStart);
+        webRTCService.on('typing_stop', handleTypingStop);
 
         return () => {
             webRTCService.off('chat_message', handleChatMsg);
             webRTCService.off('chat_history', handleHistory);
             webRTCService.off('participants_list', handleParticipants);
             webRTCService.off('sync_state', handleSync);
+            webRTCService.off('role_update', handleRoleUpdate);
+            webRTCService.off('typing_start', handleTypingStart);
+            webRTCService.off('typing_stop', handleTypingStop);
         };
-    }, [contentUrl, partyId]);
+    }, [contentUrl, partyId, navigation, userName]);
+
+    useEffect(() => {
+        if (isChatOpen) {
+            setUnreadCount(0);
+        }
+    }, [isChatOpen]);
 
     // ... (rest of logic)
 
@@ -201,24 +281,52 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
         // Send to backend
         webRTCService.sendChatMessage(messageText);
         setMessageText('');
+        setIsTyping(false);
+        webRTCService.stopTyping();
+    };
+
+    const shareParty = async () => {
+        try {
+            const deepLink = `enlyn://party/${partyId}`;
+            const message = `Join my Enlyn WatchParty!\nParty Code: ${partyId}\nOpen in app: ${deepLink}`;
+            await Share.share({
+                message,
+                title: 'Join My Party',
+            });
+        } catch (err) {
+            console.error('Share failed', err);
+        }
     };
 
     // Missing Handlers
     const onProgress = (current: number, total: number) => {
         setCurrentTime(current);
         setDuration(total);
+
+        if (!isHost) return;
+        const now = Date.now();
+        if (now - lastPlaybackSyncRef.current > 2000) {
+            lastPlaybackSyncRef.current = now;
+            webRTCService.updatePlaybackState(isPlaying, current * 1000, safeUrl);
+        }
     };
 
     const togglePlayback = () => {
-        setIsPlaying(!isPlaying);
+        const next = !isPlaying;
+        setIsPlaying(next);
+        webRTCService.updatePlaybackState(next, currentTime * 1000, safeUrl);
     };
 
     const skipBackward = () => {
-        setSeekingVal(currentTime - 10);
+        const next = Math.max(0, currentTime - 10);
+        setSeekingVal(next);
+        webRTCService.updatePlaybackState(isPlaying, next * 1000, safeUrl);
     };
 
     const skipForward = () => {
-        setSeekingVal(currentTime + 10);
+        const next = currentTime + 10;
+        setSeekingVal(next);
+        webRTCService.updatePlaybackState(isPlaying, next * 1000, safeUrl);
     };
 
     const toggleFullscreen = async () => {
@@ -305,13 +413,56 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                     /* --- TWITCH --- */
                     : playerSource.provider === 'twitch' ? (
                         <WebView
-                            source={{ uri: `https://player.twitch.tv/?${playerSource.type}=${playerSource.id}&parent=twitch.tv&autoplay=true&muted=false&controls=true` }}
+                            ref={twitchWebViewRef}
+                            source={{
+                                uri: playerSource.type === 'video'
+                                    ? `https://m.twitch.tv/videos/${playerSource.id}`
+                                    : `https://m.twitch.tv/${playerSource.id}`,
+                            }}
                             style={{ flex: 1, backgroundColor: 'black' }}
                             javaScriptEnabled={true}
                             domStorageEnabled={true}
                             allowsInlineMediaPlayback={true}
+                            allowsFullscreenVideo={true}
+                            setSupportMultipleWindows={false}
                             originWhitelist={['*']}
                             mediaPlaybackRequiresUserAction={false}
+                            androidLayerType="hardware"
+                            onMessage={(event) => {
+                                try {
+                                    const data = JSON.parse(event.nativeEvent.data || '{}');
+                                    if (data?.type === 'TWITCH_STALL') {
+                                        const now = Date.now();
+                                        if (now - twitchReloadGuardRef.current > 15000) {
+                                            twitchReloadGuardRef.current = now;
+                                            twitchWebViewRef.current?.reload();
+                                        }
+                                    }
+                                } catch { }
+                            }}
+                            injectedJavaScript={`
+                                (function() {
+                                    var lastTime = 0;
+                                    var stuckFor = 0;
+                                    setInterval(function() {
+                                        var v = document.querySelector('video');
+                                        if (!v) return;
+                                        var t = Number(v.currentTime || 0);
+                                        var paused = !!v.paused;
+                                        if (!paused && t > 0 && Math.abs(t - lastTime) < 0.01) {
+                                            stuckFor += 2;
+                                        } else {
+                                            stuckFor = 0;
+                                        }
+                                        lastTime = t;
+                                        if (stuckFor >= 8) {
+                                            window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'TWITCH_STALL' }));
+                                            stuckFor = 0;
+                                        }
+                                    }, 2000);
+                                })();
+                                true;
+                            `}
                             userAgent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
                         />
                     )
@@ -351,13 +502,13 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                         {showControls && (
                             <>
                                 <View style={styles.centerControls}>
-                                    <TouchableOpacity onPress={skipBackward} style={styles.skipButton}>
+                                    <TouchableOpacity onPress={skipBackward} style={[styles.skipButton, !isHost && styles.disabledControl]}>
                                         <MaterialIcons name="replay-10" size={42} color="white" />
                                     </TouchableOpacity>
-                                    <TouchableOpacity onPress={togglePlayback} style={styles.playButton}>
+                                    <TouchableOpacity onPress={togglePlayback} style={[styles.playButton, !isHost && styles.disabledControl]}>
                                         <Ionicons name={isPlaying ? "pause" : "play"} size={44} color="black" style={{ marginLeft: isPlaying ? 0 : 4 }} />
                                     </TouchableOpacity>
-                                    <TouchableOpacity onPress={skipForward} style={styles.skipButton}>
+                                    <TouchableOpacity onPress={skipForward} style={[styles.skipButton, !isHost && styles.disabledControl]}>
                                         <MaterialIcons name="forward-10" size={42} color="white" />
                                     </TouchableOpacity>
                                 </View>
@@ -367,7 +518,12 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                                     <Slider
                                         style={styles.slider}
                                         minimumValue={0} maximumValue={duration} value={currentTime}
-                                        onSlidingComplete={setSeekingVal}
+                                        onSlidingComplete={(value) => {
+                                            setSeekingVal(value);
+                                            if (isHost) {
+                                                webRTCService.updatePlaybackState(isPlaying, value * 1000, safeUrl);
+                                            }
+                                        }}
                                         minimumTrackTintColor="#34C759"
                                         maximumTrackTintColor="#ffffff"
                                         thumbTintColor="#34C759"
@@ -390,8 +546,26 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                         <TouchableOpacity style={styles.controlBtn} onPress={() => setIsChatOpen(true)}>
                             <Ionicons name="chatbubble" size={20} color="white" style={{ marginBottom: 2 }} />
                             <Text style={styles.controlText}>Chat</Text>
+                            {unreadCount > 0 && (
+                                <View style={styles.chatBadge}>
+                                    <Text style={styles.chatBadgeText}>{unreadCount > 9 ? '9+' : unreadCount}</Text>
+                                </View>
+                            )}
                         </TouchableOpacity>
+                        <TouchableOpacity style={styles.controlBtn} onPress={shareParty}>
+                            <Ionicons name="share-social" size={20} color="white" style={{ marginBottom: 2 }} />
+                            <Text style={styles.controlText}>Share</Text>
+                        </TouchableOpacity>
+                        <View style={[styles.controlBtn, { backgroundColor: isHost ? '#1B6F3A' : '#333' }]}>
+                            <Ionicons name={isHost ? 'shield-checkmark' : 'people'} size={20} color="white" style={{ marginBottom: 2 }} />
+                            <Text style={styles.controlText}>{isHost ? 'Host' : 'Guest'}</Text>
+                        </View>
                     </View>
+                    {!webrtcSupported && (
+                        <Text style={styles.webrtcNotice}>
+                            Voice/video chat is disabled in Expo Go. Use a development build to enable react-native-webrtc.
+                        </Text>
+                    )}
 
                     <View style={styles.bottomPanel}>
                         <Text style={styles.sectionTitle}>Participants</Text>
@@ -400,8 +574,8 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                             {/* LOCAL USER (ME) */}
                             <View style={styles.participantTile}>
                                 <View style={[styles.cameraContainer, { backgroundColor: '#333' }]}>
-                                    {localStream ? (
-                                        <RTCView
+                                    {webrtcSupported && RTCViewComponent && localStream ? (
+                                        <RTCViewComponent
                                             streamURL={localStream.toURL()}
                                             style={styles.rtcVideo}
                                             objectFit="cover"
@@ -422,8 +596,8 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                                 return (
                                     <View key={p.userId || i} style={styles.participantTile}>
                                         <View style={[styles.cameraContainer, { backgroundColor: '#222' }]}>
-                                            {stream ? (
-                                                <RTCView
+                                            {webrtcSupported && RTCViewComponent && stream ? (
+                                                <RTCViewComponent
                                                     streamURL={stream.toURL()}
                                                     style={styles.rtcVideo}
                                                     objectFit="cover"
@@ -435,7 +609,7 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                                             )}
                                             <View style={styles.nameTag}>
                                                 <Text style={styles.nameText}>
-                                                    {p.userId ? p.userId.substr(0, 4) : `Guest ${i + 1}`}
+                                                    {p.userName || (p.userId ? p.userId.substr(0, 4) : `Guest ${i + 1}`)}
                                                 </Text>
                                             </View>
                                         </View>
@@ -454,6 +628,11 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                         <Text style={styles.chatTitle}>Chat</Text>
                         <TouchableOpacity onPress={() => setIsChatOpen(false)}><Text style={styles.closeText}>Close</Text></TouchableOpacity>
                     </View>
+                    {Object.keys(typingUsers).length > 0 && (
+                        <Text style={styles.typingNotice}>
+                            {Object.values(typingUsers).join(', ')} {Object.keys(typingUsers).length > 1 ? 'are' : 'is'} typing...
+                        </Text>
+                    )}
                     <ScrollView style={styles.chatList}>
                         {messages.map((m, i) => (
                             <View key={i} style={styles.chatMsg}>
@@ -463,7 +642,30 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                         ))}
                     </ScrollView>
                     <View style={styles.chatInputRow}>
-                        <TextInput style={styles.chatInput} value={messageText} onChangeText={setMessageText} placeholder="Type..." placeholderTextColor="#666" />
+                        <TextInput
+                            style={styles.chatInput}
+                            value={messageText}
+                            onChangeText={(text) => {
+                                setMessageText(text);
+                                if (!isTyping && text.trim().length > 0) {
+                                    setIsTyping(true);
+                                    webRTCService.startTyping();
+                                }
+                                if (typingStopTimeoutRef.current) {
+                                    clearTimeout(typingStopTimeoutRef.current);
+                                }
+                                typingStopTimeoutRef.current = setTimeout(() => {
+                                    setIsTyping(false);
+                                    webRTCService.stopTyping();
+                                }, 1200);
+                                if (text.trim().length === 0) {
+                                    setIsTyping(false);
+                                    webRTCService.stopTyping();
+                                }
+                            }}
+                            placeholder="Type..."
+                            placeholderTextColor="#666"
+                        />
                         <TouchableOpacity onPress={sendMessage}><Text style={styles.sendText}>Send</Text></TouchableOpacity>
                     </View>
                 </View>
@@ -497,6 +699,7 @@ const styles = StyleSheet.create({
     centerControls: { flex: 1, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 40 },
     playButton: { width: 72, height: 72, borderRadius: 36, backgroundColor: 'white', justifyContent: 'center', alignItems: 'center' },
     skipButton: { padding: 10 },
+    disabledControl: { opacity: 0.45 },
 
     controlBarBottom: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16 },
     slider: { flex: 1, marginHorizontal: 10 },
@@ -505,6 +708,20 @@ const styles = StyleSheet.create({
     controlBar: { flexDirection: 'row', padding: 12, justifyContent: 'space-around', backgroundColor: '#111' },
     controlBtn: { padding: 10, borderRadius: 8, backgroundColor: '#333', minWidth: 80, alignItems: 'center', justifyContent: 'center' },
     controlText: { fontWeight: '600', color: '#fff', fontSize: 12, marginTop: 2 },
+    webrtcNotice: { color: '#f5c451', fontSize: 12, paddingHorizontal: 14, paddingBottom: 6 },
+    chatBadge: {
+        position: 'absolute',
+        top: 4,
+        right: 6,
+        minWidth: 18,
+        height: 18,
+        borderRadius: 9,
+        backgroundColor: '#FF3B30',
+        alignItems: 'center',
+        justifyContent: 'center',
+        paddingHorizontal: 4,
+    },
+    chatBadgeText: { color: 'white', fontSize: 10, fontWeight: '700' },
 
     bottomPanel: { flex: 1, padding: 16 },
     sectionTitle: { color: 'white', fontSize: 18, fontWeight: 'bold', marginBottom: 12 },
@@ -529,6 +746,7 @@ const styles = StyleSheet.create({
     chatContainer: { flex: 1, backgroundColor: '#1c1c1e' },
     chatHeader: { flexDirection: 'row', justifyContent: 'space-between', padding: 16, borderBottomWidth: 1, borderBottomColor: '#333' },
     chatTitle: { color: 'white', fontSize: 17, fontWeight: '600' },
+    typingNotice: { color: '#8EA7FF', fontSize: 12, paddingHorizontal: 16, paddingTop: 8 },
     closeText: { color: '#007AFF', fontSize: 16 },
     chatList: { flex: 1, padding: 16 },
     chatMsg: { marginBottom: 16 },

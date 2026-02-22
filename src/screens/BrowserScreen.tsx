@@ -3,25 +3,153 @@ import { View, StyleSheet, SafeAreaView, ActivityIndicator, TouchableOpacity, Te
 import { WebView } from 'react-native-webview';
 import { BlurView } from 'expo-blur';
 import { Ionicons } from '@expo/vector-icons';
+import { ENABLE_NOLBOX } from '../config/features';
 
 export const BrowserScreen = ({ route, navigation }: any) => {
-    const { startUrl = 'https://m.youtube.com' } = route.params || {};
+    const { startUrl = 'https://m.youtube.com', userName = 'Guest' } = route.params || {};
     const [progress, setProgress] = useState(0);
     const [currentUrl, setCurrentUrl] = useState(startUrl);
     const [detectedVideo, setDetectedVideo] = useState<{ src?: string, pageUrl: string } | null>(null);
+    const hasAutoNavigated = useRef(false);
+    const lastNolboxPlayIntentAt = useRef(0);
+
+    const generatePartyId = () => Math.random().toString(36).substring(2, 8).toUpperCase();
+    const hasNolboxPlayerHash = (url: string) => /nolbox\.in/i.test(url) && /#player=\d+/i.test(url);
+    const isNolboxPlaybackUrl = (url: string) =>
+        /nolbox\.in/i.test(url) &&
+        (/\/(watch|movie|series|episode|content|video)\b/i.test(url) ||
+            /[?&#](id|vid|video|movie|series|episode|player)=/i.test(url));
 
     // INJECTED JS TO SNIFF VIDEOS
     const snifferScript = `
         (function() {
-            document.addEventListener('play', function(e) {
-                if(e.target.tagName === 'VIDEO') {
+            var lastSentAt = 0;
+            function canSend() {
+                var now = Date.now();
+                if (now - lastSentAt < 700) return false;
+                lastSentAt = now;
+                return true;
+            }
+
+            function sendDetection(video, reason) {
+                if (!video) return;
+                try {
+                    if (!canSend()) return;
+                    var current = video.currentSrc || video.src || '';
                     window.ReactNativeWebView.postMessage(JSON.stringify({
                         type: 'VIDEO_DETECTED',
-                        src: e.target.src,
-                        pageUrl: window.location.href
+                        reason: reason || 'unknown',
+                        src: current,
+                        pageUrl: window.location.href,
+                        currentTime: Number(video.currentTime || 0),
+                        paused: !!video.paused
                     }));
+                } catch (e) {}
+            }
+
+            function sendIframeDetection(src, reason) {
+                try {
+                    if (!src || !canSend()) return;
+                    window.ReactNativeWebView.postMessage(JSON.stringify({
+                        type: 'VIDEO_DETECTED',
+                        reason: reason || 'iframe-detected',
+                        src: src,
+                        pageUrl: window.location.href,
+                        currentTime: 0,
+                        paused: false
+                    }));
+                } catch (e) {}
+            }
+
+            function scanForPlayingVideo() {
+                try {
+                    var vids = document.querySelectorAll('video');
+                    for (var i = 0; i < vids.length; i++) {
+                        var v = vids[i];
+                        if (v && (v.currentSrc || v.src) && (!v.paused || v.readyState >= 3)) {
+                            sendDetection(v, 'polling-playing-video');
+                            return;
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            try {
+                var originalPlay = HTMLMediaElement && HTMLMediaElement.prototype && HTMLMediaElement.prototype.play;
+                if (originalPlay) {
+                    HTMLMediaElement.prototype.play = function() {
+                        sendDetection(this, 'play-hook');
+                        return originalPlay.apply(this, arguments);
+                    };
+                }
+            } catch (e) {}
+
+            document.addEventListener('play', function(e) {
+                if (e.target && e.target.tagName === 'VIDEO') {
+                    sendDetection(e.target, 'play-event');
                 }
             }, true);
+
+            document.addEventListener('playing', function(e) {
+                if (e.target && e.target.tagName === 'VIDEO') {
+                    sendDetection(e.target, 'playing-event');
+                }
+            }, true);
+
+            document.addEventListener('click', function(e) {
+                try {
+                    var el = e.target;
+                    var text = '';
+                    if (el) {
+                        text = [
+                            el.innerText || '',
+                            el.textContent || '',
+                            el.getAttribute && (el.getAttribute('aria-label') || ''),
+                            el.id || '',
+                            el.className || ''
+                        ].join(' ').toLowerCase();
+                    }
+                    if (/play|watch|episode|movie|start|resume/.test(text)) {
+                        window.ReactNativeWebView.postMessage(JSON.stringify({
+                            type: 'PLAY_INTENT',
+                            pageUrl: window.location.href
+                        }));
+                    }
+                } catch (err) {}
+            }, true);
+
+            try {
+                var observer = new MutationObserver(function(mutations) {
+                    mutations.forEach(function(m) {
+                        if (!m.addedNodes) return;
+                        for (var i = 0; i < m.addedNodes.length; i++) {
+                            var node = m.addedNodes[i];
+                            if (!node || !node.querySelectorAll) continue;
+                            if (node.tagName === 'IFRAME' && node.src) {
+                                sendIframeDetection(node.src, 'mutation-iframe');
+                                return;
+                            }
+                            var iframes = node.querySelectorAll('iframe');
+                            for (var j = 0; j < iframes.length; j++) {
+                                if (iframes[j] && iframes[j].src) {
+                                    sendIframeDetection(iframes[j].src, 'mutation-iframe');
+                                    return;
+                                }
+                            }
+                            var videos = node.querySelectorAll('video');
+                            for (var k = 0; k < videos.length; k++) {
+                                sendDetection(videos[k], 'mutation-video');
+                                return;
+                            }
+                        }
+                    });
+                });
+                observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
+            } catch (e) {}
+
+            setInterval(function() {
+                scanForPlayingVideo();
+            }, 1200);
         })();
     `;
 
@@ -29,23 +157,22 @@ export const BrowserScreen = ({ route, navigation }: any) => {
         const { url } = navState;
         setCurrentUrl(url);
 
-        // Helper to generate ID
-        const generatePartyId = () => Math.random().toString(36).substring(2, 8).toUpperCase();
-
         // 1. YouTube & Twitch: Auto-Intercept
         if (url.includes('youtube.com/watch') || url.includes('youtu.be/')) {
-            navigation.replace('PartyRoom', { contentUrl: url, partyId: generatePartyId() });
+            navigation.replace('PartyRoom', { contentUrl: url, partyId: generatePartyId(), userName });
             return;
         }
         if (url.includes('twitch.tv/')) {
             if (url !== 'https://m.twitch.tv/' && !url.includes('/search') && !url.includes('/directory')) {
-                navigation.replace('PartyRoom', { contentUrl: url, partyId: generatePartyId() });
+                navigation.replace('PartyRoom', { contentUrl: url, partyId: generatePartyId(), userName });
                 return;
             }
         }
+        // Nolbox should only auto-jump after actual playback detection.
 
         // 2. Generic Sites: Reset detection on nav change
         if (url !== detectedVideo?.pageUrl) {
+            hasAutoNavigated.current = false;
             setDetectedVideo(null);
         }
     };
@@ -53,11 +180,60 @@ export const BrowserScreen = ({ route, navigation }: any) => {
     const handleMessage = (event: any) => {
         try {
             const data = JSON.parse(event.nativeEvent.data);
+            if (data.type === 'PLAY_INTENT') {
+                const url = typeof data.pageUrl === 'string' ? data.pageUrl : currentUrl;
+                if (ENABLE_NOLBOX && url.includes('nolbox.in')) {
+                    lastNolboxPlayIntentAt.current = Date.now();
+                    setDetectedVideo({ src: '', pageUrl: url });
+                }
+                return;
+            }
             if (data.type === 'VIDEO_DETECTED') {
-                // If it's a blob, we usually can't play it directly in another webview easily without keeping session.
-                // But we can try to pass the Page URL and use a "Web Player" mode.
-                // If it's an mp4 loop, we can pass the src.
-                setDetectedVideo({ src: data.src, pageUrl: data.pageUrl });
+                const payload = { src: data.src, pageUrl: data.pageUrl };
+                setDetectedVideo(payload);
+
+                const isNolbox = ENABLE_NOLBOX && typeof data.pageUrl === 'string' && data.pageUrl.includes('nolbox.in');
+                if (isNolbox && !hasAutoNavigated.current) {
+                    const reason = typeof data.reason === 'string' ? data.reason : '';
+                    const currentTime = Number(data.currentTime || 0);
+                    const paused = Boolean(data.paused);
+                    const recentlyIntendedPlay = Date.now() - lastNolboxPlayIntentAt.current < 15000;
+                    const pageUrl = typeof data.pageUrl === 'string' ? data.pageUrl : currentUrl;
+                    const pageHasPlayerHash = hasNolboxPlayerHash(pageUrl);
+                    const src = typeof data.src === 'string' ? data.src : '';
+                    const isVidkingSrc = /vidking\.net/i.test(src);
+                    const definitePlaybackReason =
+                        reason === 'playing-event' ||
+                        reason === 'polling-playing-video' ||
+                        reason === 'mutation-video' ||
+                        ((reason === 'play-event' || reason === 'play-hook') && (!paused || currentTime > 0.2));
+
+                    const iframePlaybackReason =
+                        reason === 'mutation-iframe' &&
+                        (isVidkingSrc || pageHasPlayerHash) &&
+                        (recentlyIntendedPlay || pageHasPlayerHash);
+
+                    hasAutoNavigated.current = true;
+                    const hasPlayableSrc =
+                        src.startsWith('http') &&
+                        !src.startsWith('blob:') &&
+                        !src.includes('.m3u8') &&
+                        !src.includes('googleads') &&
+                        !src.includes('doubleclick');
+                    const playbackLikely =
+                        definitePlaybackReason ||
+                        iframePlaybackReason ||
+                        currentTime > 0.2 ||
+                        (isNolboxPlaybackUrl(pageUrl) && recentlyIntendedPlay);
+
+                    if (!playbackLikely) {
+                        hasAutoNavigated.current = false;
+                        return;
+                    }
+
+                    const targetUrl = hasPlayableSrc ? src : pageUrl;
+                    navigation.replace('PartyRoom', { contentUrl: targetUrl, partyId: generatePartyId(), userName });
+                }
             }
         } catch (e) { }
     };
@@ -72,7 +248,7 @@ export const BrowserScreen = ({ route, navigation }: any) => {
         const targetUrl = isDirect ? detectedVideo.src : detectedVideo.pageUrl;
         const newPartyId = Math.random().toString(36).substring(2, 8).toUpperCase();
 
-        navigation.replace('PartyRoom', { contentUrl: targetUrl, partyId: newPartyId });
+        navigation.replace('PartyRoom', { contentUrl: targetUrl, partyId: newPartyId, userName });
     };
 
     return (
@@ -118,7 +294,9 @@ export const BrowserScreen = ({ route, navigation }: any) => {
             {detectedVideo && (
                 <TouchableOpacity style={styles.fab} onPress={handleWatchDetected}>
                     <Ionicons name="play" size={24} color="white" />
-                    <Text style={styles.fabText}>Watch Found Video</Text>
+                    <Text style={styles.fabText}>
+                        {detectedVideo.src ? 'Watch Found Video' : 'Watch Current Page'}
+                    </Text>
                 </TouchableOpacity>
             )}
         </View>
