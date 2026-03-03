@@ -40,7 +40,7 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
     const [isTyping, setIsTyping] = useState(false);
     const [typingUsers, setTypingUsers] = useState<Record<string, string>>({});
     const [unreadCount, setUnreadCount] = useState(0);
-    const [messages, setMessages] = useState<{ user: string, text: string, id: string }[]>([]);
+    const [messages, setMessages] = useState<{ user: string, text: string, id: string, isMe: boolean }[]>([]);
 
     // WebRTC State
     const [localStream, setLocalStream] = useState<any>(null);
@@ -190,9 +190,10 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
 
             if (data) {
                 setMessages(data.map(m => ({
-                    user: m.userId === webRTCService.userId ? 'Me' : m.userName,
+                    user: m.userName || m.userId.substr(0, 4),
                     text: m.text,
-                    id: m.id
+                    id: m.id,
+                    isMe: m.userId === webRTCService.userId
                 })));
             }
         };
@@ -215,9 +216,10 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                         }
 
                         return [...prev, {
-                            user: isMe ? 'Me' : msg.userName,
+                            user: msg.userName || msg.userId.substr(0, 4),
                             text: msg.text,
-                            id: msg.id
+                            id: msg.id,
+                            isMe: isMe
                         }];
                     });
                 }, 50);
@@ -226,9 +228,10 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
 
         const handleHistory = (history: any[]) => {
             const formatted = history.map(h => ({
-                user: h.user_id === webRTCService.userId ? 'Me' : (h.userName || h.user_name || (h.user_id ? `User ${h.user_id.substr(0, 4)}` : 'Unknown')),
+                user: h.userName || h.user_name || (h.user_id ? `User ${h.user_id.substr(0, 4)}` : 'Unknown'),
                 text: h.text,
-                id: h.id || String(Math.random())
+                id: h.id || String(Math.random()),
+                isMe: h.user_id === webRTCService.userId
             }));
             setMessages(prev => [...prev, ...formatted]);
         };
@@ -309,7 +312,7 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
 
         // Optimistically insert
         const tempId = `temp-${Date.now()}`;
-        setMessages(prev => [...prev, { user: 'Me', text: currentText, id: tempId }]);
+        setMessages(prev => [...prev, { user: userName, text: currentText, id: tempId, isMe: true }]);
 
         // Send to Supabase
         const { error } = await supabase.from('party_messages').insert([{
@@ -695,10 +698,10 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                         )}
                         <ScrollView style={styles.chatList}>
                             {messages.map((m, i) => (
-                                <View key={i} style={[styles.chatMsgWrapper, m.user === 'Me' ? styles.chatMsgWrapperMe : styles.chatMsgWrapperOther]}>
-                                    {m.user !== 'Me' && <Text style={styles.chatUser}>{m.user}</Text>}
-                                    <View style={[styles.chatBubble, m.user === 'Me' ? styles.chatBubbleMe : styles.chatBubbleOther]}>
-                                        <Text style={[styles.chatText, m.user === 'Me' ? styles.chatTextMe : styles.chatTextOther]}>{m.text}</Text>
+                                <View key={i} style={[styles.chatMsgWrapper, m.isMe ? styles.chatMsgWrapperMe : styles.chatMsgWrapperOther]}>
+                                    <Text style={styles.chatUser}>{m.user}</Text>
+                                    <View style={[styles.chatBubble, m.isMe ? styles.chatBubbleMe : styles.chatBubbleOther]}>
+                                        <Text style={[styles.chatText, m.isMe ? styles.chatTextMe : styles.chatTextOther]}>{m.text}</Text>
                                     </View>
                                 </View>
                             ))}

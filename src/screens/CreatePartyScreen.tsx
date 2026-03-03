@@ -52,6 +52,20 @@ export const CreatePartyScreen = ({ navigation, route }: any) => {
 
     const [joinId, setJoinId] = useState('');
     const [showSettings, setShowSettings] = useState(false);
+    const [isDarkMode, setIsDarkMode] = useState(true);
+
+    const theme = {
+        bg: isDarkMode ? '#05070D' : '#F8FAFC',
+        text: isDarkMode ? 'white' : '#0F172A',
+        subtext: isDarkMode ? '#8FA0C0' : '#64748B',
+        card: isDarkMode ? '#0D1220' : '#FFFFFF',
+        cardBorder: isDarkMode ? '#1E2433' : '#E2E8F0',
+        input: isDarkMode ? '#161B22' : '#F1F5F9',
+        inputBorder: isDarkMode ? '#2D3748' : '#CBD5E1',
+        iconBg: isDarkMode ? '#1A1D24' : '#E2E8F0',
+        modalOverlay: isDarkMode ? 'rgba(0,0,0,0.6)' : 'rgba(15,23,42,0.4)',
+        modalBg: isDarkMode ? '#0D1117' : '#FFFFFF',
+    };
 
     const handleAppSelect = (app: any) => {
         navigation.navigate('Browser', { startUrl: app.url, userName });
@@ -63,18 +77,18 @@ export const CreatePartyScreen = ({ navigation, route }: any) => {
     };
 
     return (
-        <SafeAreaView style={styles.container}>
-            <View style={styles.glowA} />
-            <View style={styles.glowB} />
+        <SafeAreaView style={[styles.container, { backgroundColor: theme.bg }]}>
+            <View style={[styles.glowA, !isDarkMode && { opacity: 0.3 }]} />
+            <View style={[styles.glowB, !isDarkMode && { opacity: 0.3 }]} />
 
             {/* Header */}
-            <View style={styles.header}>
+            <View style={[styles.header, { borderBottomColor: theme.cardBorder }]}>
                 <View>
-                    <Text style={styles.greeting}>Start Watching</Text>
-                    <Text style={styles.subtitle}>Choose an app to browse</Text>
+                    <Text style={[styles.greeting, { color: theme.text }]}>Start Watching</Text>
+                    <Text style={[styles.subtitle, { color: theme.subtext }]}>Choose an app to browse</Text>
                 </View>
-                <TouchableOpacity style={styles.userBadge} onPress={() => setShowSettings(true)}>
-                    <Text style={styles.userName}>{userName}</Text>
+                <TouchableOpacity style={[styles.userBadge, { backgroundColor: theme.input, borderColor: theme.inputBorder }]} onPress={() => setShowSettings(true)}>
+                    <Text style={[styles.userName, { color: theme.text }]}>{userName}</Text>
                     <View style={styles.avatarPlaceholder}>
                         <Text style={styles.avatarLetter}>{userName[0]?.toUpperCase()}</Text>
                     </View>
@@ -85,14 +99,14 @@ export const CreatePartyScreen = ({ navigation, route }: any) => {
 
                 {/* Join Party Section */}
                 <View style={styles.sectionHeader}>
-                    <Text style={styles.sectionTitle}>Join a Party</Text>
+                    <Text style={[styles.sectionTitle, { color: theme.text }]}>Join a Party</Text>
                 </View>
-                <View style={styles.searchContainer}>
-                    <Ionicons name="people" size={20} color="#8F9BB3" style={styles.searchIcon} />
+                <View style={[styles.searchContainer, { backgroundColor: theme.input, borderColor: theme.inputBorder }]}>
+                    <Ionicons name="people" size={20} color={theme.subtext} style={styles.searchIcon} />
                     <TextInput
-                        style={styles.searchInput}
+                        style={[styles.searchInput, { color: theme.text }]}
                         placeholder="Enter Party ID (e.g. 1234)"
-                        placeholderTextColor="#6E7380"
+                        placeholderTextColor={theme.subtext}
                         value={joinId}
                         onChangeText={setJoinId}
                     />
@@ -106,10 +120,10 @@ export const CreatePartyScreen = ({ navigation, route }: any) => {
                     {VISIBLE_APPS.map((app, i) => (
                         <TouchableOpacity
                             key={i}
-                            style={styles.appRow}
+                            style={[styles.appRow, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}
                             onPress={() => handleAppSelect(app)}
                         >
-                            <View style={[styles.rowIconContainer, { backgroundColor: app.name === 'Twitch' ? '#2A1847' : (app.name === 'Google Drive' ? '#1A2A47' : '#1A1D24') }]}>
+                            <View style={[styles.rowIconContainer, { backgroundColor: app.name === 'Twitch' ? (isDarkMode ? '#2A1847' : '#EAE3F7') : (app.name === 'Google Drive' ? (isDarkMode ? '#1A2A47' : '#E6F0FD') : theme.iconBg) }]}>
                                 {app.isCustomLogo ? (
                                     <View style={styles.nolboxLogo}>
                                         <Text style={styles.nolboxLogoText}>N</Text>
@@ -119,10 +133,10 @@ export const CreatePartyScreen = ({ navigation, route }: any) => {
                                 )}
                             </View>
                             <View style={styles.rowContent}>
-                                <Text style={styles.appName}>{app.name}</Text>
-                                <Text style={styles.appUrl}>{new URL(app.url).hostname}</Text>
+                                <Text style={[styles.appName, { color: theme.text }]}>{app.name}</Text>
+                                <Text style={[styles.appUrl, { color: theme.subtext }]}>{new URL(app.url).hostname}</Text>
                             </View>
-                            <View style={styles.goArrowCircle}>
+                            <View style={[styles.goArrowCircle, { backgroundColor: theme.inputBorder }]}>
                                 <Ionicons name="chevron-forward" size={16} color="white" />
                             </View>
                         </TouchableOpacity>
@@ -130,10 +144,10 @@ export const CreatePartyScreen = ({ navigation, route }: any) => {
                 </View>
 
                 {ENABLE_NOLBOX && (
-                    <View style={styles.footerCard}>
-                        <Ionicons name="bulb" size={18} color="#A4FF8A" style={{ marginBottom: 6 }} />
-                        <Text style={styles.footerTitle}>Tip</Text>
-                        <Text style={styles.footerText}>
+                    <View style={[styles.footerCard, !isDarkMode && { backgroundColor: '#EFFFF4', borderColor: '#C3F2D4' }]}>
+                        <Ionicons name="bulb" size={18} color={isDarkMode ? "#A4FF8A" : "#34C759"} style={{ marginBottom: 6 }} />
+                        <Text style={[styles.footerTitle, !isDarkMode && { color: '#34C759' }]}>Tip</Text>
+                        <Text style={[styles.footerText, !isDarkMode && { color: '#166534' }]}>
                             For Nolbox, start the show in browser and Enlyn will auto-detect playback and launch your party room.
                         </Text>
                     </View>
@@ -142,21 +156,32 @@ export const CreatePartyScreen = ({ navigation, route }: any) => {
 
             {/* Settings Modal */}
             <Modal visible={showSettings} animationType="slide" transparent={true}>
-                <View style={styles.modalOverlayWrapper}>
+                <View style={[styles.modalOverlayWrapper, { backgroundColor: theme.modalOverlay }]}>
                     <TouchableOpacity style={styles.modalBackdrop} activeOpacity={1} onPress={() => setShowSettings(false)} />
-                    <View style={styles.modalContent}>
-                        <View style={styles.modalHeader}>
-                            <Text style={styles.modalTitle}>Account Profile</Text>
+                    <View style={[styles.modalContent, { backgroundColor: theme.modalBg, borderColor: theme.cardBorder }]}>
+                        <View style={[styles.modalHeader, { borderBottomColor: theme.cardBorder }]}>
+                            <Text style={[styles.modalTitle, { color: theme.text }]}>Account Profile</Text>
                             <TouchableOpacity onPress={() => setShowSettings(false)}>
-                                <Ionicons name="close-circle" size={28} color="#4A5568" />
+                                <Ionicons name="close-circle" size={28} color={theme.subtext} />
                             </TouchableOpacity>
                         </View>
 
                         <View style={styles.settingRow}>
-                            <Text style={styles.settingLabel}>Logged in as</Text>
-                            <View style={styles.nameBadge}>
-                                <Text style={styles.settingValue}>{userName}</Text>
+                            <Text style={[styles.settingLabel, { color: theme.subtext }]}>Logged in as</Text>
+                            <View style={[styles.nameBadge, { backgroundColor: theme.input, borderColor: theme.inputBorder }]}>
+                                <Text style={[styles.settingValue, { color: theme.text }]}>{userName}</Text>
                             </View>
+                        </View>
+
+                        <View style={styles.settingRow}>
+                            <Text style={[styles.settingLabel, { color: theme.subtext }]}>Theme Match</Text>
+                            <TouchableOpacity
+                                onPress={() => setIsDarkMode(!isDarkMode)}
+                                style={[styles.modalThemeBtn, { backgroundColor: theme.input, borderColor: theme.inputBorder }]}
+                            >
+                                <Ionicons name={isDarkMode ? 'sunny' : 'moon'} size={15} color={isDarkMode ? '#F59E0B' : '#4F46E5'} />
+                                <Text style={[styles.settingValue, { color: theme.text, fontSize: 13, marginLeft: 6 }]}>{isDarkMode ? 'Dark' : 'Light'}</Text>
+                            </TouchableOpacity>
                         </View>
 
                         <TouchableOpacity style={styles.logoutBtn} onPress={() => { setShowSettings(false); navigation.replace('Onboarding'); }}>
@@ -281,6 +306,7 @@ const styles = StyleSheet.create({
     settingLabel: { color: '#8FA0C0', fontWeight: '600', fontSize: 15 },
     nameBadge: { backgroundColor: '#161B22', paddingHorizontal: 16, paddingVertical: 8, borderRadius: 12, borderWidth: 1, borderColor: '#2D3748' },
     settingValue: { color: 'white', fontWeight: '800', fontSize: 15 },
+    modalThemeBtn: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 8, borderRadius: 12, borderWidth: 1 },
 
     logoutBtn: { backgroundColor: 'rgba(255, 59, 48, 0.1)', flexDirection: 'row', padding: 16, borderRadius: 16, justifyContent: 'center', alignItems: 'center', gap: 8, borderWidth: 1, borderColor: 'rgba(255, 59, 48, 0.3)' },
     logoutText: { color: '#FF3B30', fontWeight: '800', fontSize: 16 },
