@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
-import { io, Socket } from 'socket.io-client';
 import { Platform } from 'react-native';
+import { supabase } from './supabaseConfig';
+import { RealtimeChannel } from '@supabase/supabase-js';
 
 const configuration = {
     iceServers: [
@@ -8,8 +9,6 @@ const configuration = {
         { urls: 'stun:stun1.l.google.com:19302' },
     ],
 };
-
-const DEFAULT_BACKEND_URL = Platform.OS === 'android' ? 'http://10.0.2.2:3000' : 'http://localhost:3000';
 
 const generateUserId = () => `u_${Math.random().toString(36).slice(2, 10)}`;
 
@@ -21,13 +20,15 @@ interface Participant {
 
 export class WebRTCService extends EventEmitter {
     private webrtc: any = null;
-    private socket: Socket | null = null;
+    private channel: RealtimeChannel | null = null;
     public isNativeModuleAvailable: boolean = false;
     public userId: string = generateUserId();
     public userName: string = 'Guest';
     public partyId: string | null = null;
     public isConnected: boolean = false;
     public localStream: any = null;
+    public isAudioEnabled: boolean = true;
+    public isVideoEnabled: boolean = true;
     public peers: { [userId: string]: any } = {};
     public remoteStreams: { [userId: string]: any } = {};
     public isHost: boolean = false;
@@ -47,79 +48,6 @@ export class WebRTCService extends EventEmitter {
         return this.isNativeModuleAvailable;
     }
 
-    private getBackendUrl() {
-        return process.env.EXPO_PUBLIC_BACKEND_URL || DEFAULT_BACKEND_URL;
-    }
-
-    private ensureSocket() {
-        if (this.socket) return;
-        this.socket = io(this.getBackendUrl(), {
-            transports: ['websocket'],
-            timeout: 10000,
-            reconnection: true,
-            reconnectionAttempts: 10,
-        });
-
-        this.socket.on('connect', () => {
-            this.emit('connected');
-        });
-
-        this.socket.on('disconnect', () => {
-            this.isConnected = false;
-            this.emit('disconnected');
-        });
-
-        this.socket.on('sync_state', (state: any) => {
-            this.isHost = state?.hostId === this.userId;
-            this.emit('sync_state', state);
-            this.emit('role_update', { isHost: this.isHost, hostId: state?.hostId });
-        });
-
-        this.socket.on('chat_history', (history: any[]) => {
-            this.emit('chat_history', history || []);
-        });
-
-        this.socket.on('chat_message', (msg: any) => {
-            this.emit('chat_message', msg);
-        });
-
-        this.socket.on('typing_start', (payload: any) => {
-            this.emit('typing_start', payload);
-        });
-
-        this.socket.on('typing_stop', (payload: any) => {
-            this.emit('typing_stop', payload);
-        });
-
-        this.socket.on('participants_list', (participants: Participant[]) => {
-            const list = participants || [];
-            this.isHost = !!list.find((p) => p.userId === this.userId && p.isHost);
-            this.emit('participants_list', list);
-            this.emit('role_update', { isHost: this.isHost, hostId: list.find((p) => p.isHost)?.userId || null });
-
-            list.forEach((p) => {
-                if (p.userId !== this.userId && !this.peers[p.userId]) {
-                    const shouldInitiate = this.userId < p.userId;
-                    if (shouldInitiate) {
-                        this.createPeerConnection(p.userId, true);
-                    }
-                }
-            });
-        });
-
-        this.socket.on('webrtc_offer', async ({ sdp, senderId }: any) => {
-            await this.handleSignal({ type: 'offer', data: { sdp }, senderId });
-        });
-
-        this.socket.on('webrtc_answer', async ({ sdp, senderId }: any) => {
-            await this.handleSignal({ type: 'answer', data: { sdp }, senderId });
-        });
-
-        this.socket.on('webrtc_ice_candidate', async ({ candidate, senderId }: any) => {
-            await this.handleSignal({ type: 'candidate', data: { candidate }, senderId });
-        });
-    }
-
     async getLocalStream() {
         if (!this.isNativeModuleAvailable || !this.webrtc?.mediaDevices) return null;
         if (this.localStream) return this.localStream;
@@ -135,6 +63,8 @@ export class WebRTCService extends EventEmitter {
                 },
             });
             this.localStream = stream;
+            this.isAudioEnabled = true;
+            this.isVideoEnabled = true;
             this.emit('local_stream', stream);
             return stream;
         } catch (err: any) {
@@ -148,18 +78,96 @@ export class WebRTCService extends EventEmitter {
 
         this.partyId = partyId;
         this.userName = userName?.trim() || this.userName;
-        this.ensureSocket();
 
         await this.getLocalStream();
 
-        this.socket?.emit('join_party', {
-            partyId,
-            userId: this.userId,
-            userName: this.userName,
-            contentUrl: contentUrl || '',
+        // Initialize Supabase Channel
+        this.channel = supabase.channel(`party_rtc_${partyId}`, {
+            config: {
+                presence: {
+                    key: this.userId,
+                },
+            },
         });
 
-        this.isConnected = true;
+        this.channel
+            .on('presence', { event: 'sync' }, () => {
+                const newState = this.channel?.presenceState();
+                if (!newState) return;
+
+                const participants: Participant[] = [];
+                let oldestUser: { id: string, joinedAt: number } | null = null;
+
+                for (const [key, stateArray] of Object.entries(newState)) {
+                    const state = stateArray[0] as any;
+                    participants.push({
+                        userId: key,
+                        userName: state.userName,
+                        isHost: false, // We will calculate host
+                    });
+
+                    if (!oldestUser || state.joinedAt < oldestUser.joinedAt) {
+                        oldestUser = { id: key, joinedAt: state.joinedAt };
+                    }
+                }
+
+                // The oldest user in the room becomes the host naturally
+                participants.forEach(p => {
+                    p.isHost = p.userId === oldestUser?.id;
+                });
+
+                this.isHost = this.userId === oldestUser?.id;
+
+                this.emit('participants_list', participants);
+                this.emit('role_update', { isHost: this.isHost, hostId: oldestUser?.id });
+
+                participants.forEach((p) => {
+                    if (p.userId !== this.userId && !this.peers[p.userId]) {
+                        const shouldInitiate = this.userId < p.userId;
+                        if (shouldInitiate) {
+                            this.createPeerConnection(p.userId, true);
+                        }
+                    }
+                });
+            })
+            .on('presence', { event: 'leave' }, ({ key, leftPresences }) => {
+                this.cleanupPeer(key);
+            })
+            .on('broadcast', { event: 'sync_state' }, ({ payload }) => {
+                this.emit('sync_state', payload);
+            })
+            .on('broadcast', { event: 'typing_start' }, ({ payload }) => {
+                this.emit('typing_start', payload);
+            })
+            .on('broadcast', { event: 'typing_stop' }, ({ payload }) => {
+                this.emit('typing_stop', payload);
+            })
+            .on('broadcast', { event: 'webrtc_offer' }, ({ payload }) => {
+                if (payload.targetUserId === this.userId) {
+                    this.handleSignal({ type: 'offer', data: { sdp: payload.sdp }, senderId: payload.senderId });
+                }
+            })
+            .on('broadcast', { event: 'webrtc_answer' }, ({ payload }) => {
+                if (payload.targetUserId === this.userId) {
+                    this.handleSignal({ type: 'answer', data: { sdp: payload.sdp }, senderId: payload.senderId });
+                }
+            })
+            .on('broadcast', { event: 'webrtc_ice_candidate' }, ({ payload }) => {
+                if (payload.targetUserId === this.userId) {
+                    this.handleSignal({ type: 'candidate', data: { candidate: payload.candidate }, senderId: payload.senderId });
+                }
+            });
+
+        // Track presence
+        this.channel.subscribe(async (status) => {
+            if (status === 'SUBSCRIBED') {
+                this.isConnected = true;
+                await this.channel?.track({
+                    userName: this.userName,
+                    joinedAt: Date.now()
+                });
+            }
+        });
     }
 
     async createPeerConnection(targetUserId: string, isInitiator: boolean) {
@@ -177,10 +185,14 @@ export class WebRTCService extends EventEmitter {
 
         pc.onicecandidate = async (event: any) => {
             if (!event.candidate || !this.partyId) return;
-            this.socket?.emit('webrtc_ice_candidate', {
-                partyId: this.partyId,
-                targetUserId,
-                candidate: event.candidate,
+            this.channel?.send({
+                type: 'broadcast',
+                event: 'webrtc_ice_candidate',
+                payload: {
+                    senderId: this.userId,
+                    targetUserId,
+                    candidate: event.candidate,
+                }
             });
         };
 
@@ -200,10 +212,14 @@ export class WebRTCService extends EventEmitter {
         if (isInitiator && this.partyId) {
             const offer = await pc.createOffer({});
             await pc.setLocalDescription(offer);
-            this.socket?.emit('webrtc_offer', {
-                partyId: this.partyId,
-                targetUserId,
-                sdp: offer,
+            this.channel?.send({
+                type: 'broadcast',
+                event: 'webrtc_offer',
+                payload: {
+                    senderId: this.userId,
+                    targetUserId,
+                    sdp: offer,
+                }
             });
         }
     }
@@ -225,10 +241,14 @@ export class WebRTCService extends EventEmitter {
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
                 if (this.partyId) {
-                    this.socket?.emit('webrtc_answer', {
-                        partyId: this.partyId,
-                        targetUserId: senderId,
-                        sdp: answer,
+                    this.channel?.send({
+                        type: 'broadcast',
+                        event: 'webrtc_answer',
+                        payload: {
+                            senderId: this.userId,
+                            targetUserId: senderId,
+                            sdp: answer,
+                        }
                     });
                 }
             } else if (type === 'answer') {
@@ -241,43 +261,68 @@ export class WebRTCService extends EventEmitter {
         }
     }
 
-    async sendChatMessage(text: string) {
-        if (!this.partyId || !text.trim()) return;
-        this.socket?.emit('chat_message', {
-            partyId: this.partyId,
-            userId: this.userId,
-            userName: this.userName,
-            text,
-        });
-    }
-
     startTyping() {
         if (!this.partyId) return;
-        this.socket?.emit('typing_start', {
-            partyId: this.partyId,
-            userId: this.userId,
-            userName: this.userName,
+        this.channel?.send({
+            type: 'broadcast',
+            event: 'typing_start',
+            payload: {
+                userId: this.userId,
+                userName: this.userName,
+            }
         });
     }
 
     stopTyping() {
         if (!this.partyId) return;
-        this.socket?.emit('typing_stop', {
-            partyId: this.partyId,
-            userId: this.userId,
-            userName: this.userName,
+        this.channel?.send({
+            type: 'broadcast',
+            event: 'typing_stop',
+            payload: {
+                userId: this.userId,
+                userName: this.userName,
+            }
         });
     }
 
     async updatePlaybackState(isPlaying: boolean, positionMs: number, contentUrl?: string) {
         if (!this.partyId) return;
-        this.socket?.emit('update_playback', {
-            partyId: this.partyId,
-            userId: this.userId,
-            isPlaying,
-            positionMs,
-            contentUrl: contentUrl || undefined,
+        this.channel?.send({
+            type: 'broadcast',
+            event: 'sync_state',
+            payload: {
+                hostId: this.userId,
+                isPlaying,
+                positionMs,
+                contentUrl: contentUrl || undefined,
+            }
         });
+    }
+
+    toggleAudio() {
+        if (!this.localStream) return false;
+        const audioTracks = this.localStream.getAudioTracks();
+        if (audioTracks.length > 0) {
+            this.isAudioEnabled = !this.isAudioEnabled;
+            audioTracks.forEach((track: any) => {
+                track.enabled = this.isAudioEnabled;
+            });
+            this.emit('media_toggle', { audio: this.isAudioEnabled, video: this.isVideoEnabled });
+        }
+        return this.isAudioEnabled;
+    }
+
+    toggleVideo() {
+        if (!this.localStream) return false;
+        const videoTracks = this.localStream.getVideoTracks();
+        if (videoTracks.length > 0) {
+            this.isVideoEnabled = !this.isVideoEnabled;
+            videoTracks.forEach((track: any) => {
+                track.enabled = this.isVideoEnabled;
+            });
+            this.emit('media_toggle', { audio: this.isAudioEnabled, video: this.isVideoEnabled });
+        }
+        return this.isVideoEnabled;
     }
 
     cleanupPeer(userId: string) {
@@ -299,11 +344,10 @@ export class WebRTCService extends EventEmitter {
 
         Object.keys(this.peers).forEach((uid) => this.cleanupPeer(uid));
 
-        if (this.partyId) {
-            this.socket?.emit('leave_party', {
-                partyId: this.partyId,
-                userId: this.userId,
-            });
+        if (this.channel) {
+            await this.channel.untrack();
+            await supabase.removeChannel(this.channel);
+            this.channel = null;
         }
 
         this.partyId = null;

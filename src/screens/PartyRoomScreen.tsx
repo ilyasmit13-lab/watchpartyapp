@@ -10,7 +10,7 @@ import Constants from 'expo-constants';
 import { contentProviders } from '../providers/ContentProvider';
 import { InjectedPlayer } from '../components/InjectedPlayer';
 import { webRTCService } from '../services/WebRTCService';
-import { useCameraPermissions } from 'expo-camera';
+import { supabase } from '../services/supabaseConfig';
 
 const { width, height } = Dimensions.get('window');
 
@@ -40,14 +40,13 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
     const [isTyping, setIsTyping] = useState(false);
     const [typingUsers, setTypingUsers] = useState<Record<string, string>>({});
     const [unreadCount, setUnreadCount] = useState(0);
-    const [messages, setMessages] = useState<{ user: string, text: string }[]>([
-        { user: 'System', text: `Welcome to Party ${partyId || 'Test'}` }
-    ]);
+    const [messages, setMessages] = useState<{ user: string, text: string, id: string }[]>([]);
 
     // WebRTC State
-    const [permission, requestPermission] = useCameraPermissions();
     const [localStream, setLocalStream] = useState<any>(null);
     const [remoteStreams, setRemoteStreams] = useState<{ [userId: string]: any }>({});
+    const [audioEnabled, setAudioEnabled] = useState(true);
+    const [videoEnabled, setVideoEnabled] = useState(true);
     const [RTCViewComponent, setRTCViewComponent] = useState<any>(null);
     const [webrtcSupported, setWebrtcSupported] = useState(false);
     const lastPlaybackSyncRef = useRef(0);
@@ -141,12 +140,6 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
         let isMounted = true;
 
         const init = async () => {
-            // Ensure permission is granted before attempting local media.
-            if (webrtcSupported) {
-                const granted = permission?.granted ? true : (await requestPermission())?.granted;
-                if (!granted) return;
-            }
-
             if (partyId) {
                 await webRTCService.connect(partyId, contentUrl, userName);
             }
@@ -159,7 +152,7 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
         };
 
         init();
-        
+
         // Listeners for streams
         const handleLocal = (stream: any) => setLocalStream(stream);
         const handleRemote = ({ userId, stream }: any) => {
@@ -178,29 +171,64 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
         webRTCService.on('participant_left', handleLeft);
 
         return () => {
-             isMounted = false;
-             webRTCService.leave(); 
-             webRTCService.off('local_stream', handleLocal);
-             webRTCService.off('remote_stream', handleRemote);
-             webRTCService.off('participant_left', handleLeft);
+            isMounted = false;
+            webRTCService.leave();
+            webRTCService.off('local_stream', handleLocal);
+            webRTCService.off('remote_stream', handleRemote);
+            webRTCService.off('participant_left', handleLeft);
         };
     }, [partyId, webrtcSupported, contentUrl, userName]);
 
     // Notifications & Presence & Sync
     useEffect(() => {
-        const handleChatMsg = (msg: any) => {
-            const isMe = msg.user_id === webRTCService.userId;
-            const displayUser = isMe ? 'Me' : (msg.userName || msg.user_name || (msg.user_id ? `User ${msg.user_id.substr(0, 4)}` : 'Unknown'));
-            setMessages(prev => [...prev, { user: displayUser, text: msg.text }]);
-            if (!isChatOpen && !isMe) {
-                setUnreadCount((prev) => prev + 1);
+        const fetchMessages = async () => {
+            const { data } = await supabase
+                .from('party_messages')
+                .select('*')
+                .eq('partyId', partyId)
+                .order('createdAt', { ascending: true });
+
+            if (data) {
+                setMessages(data.map(m => ({
+                    user: m.userId === webRTCService.userId ? 'Me' : m.userName,
+                    text: m.text,
+                    id: m.id
+                })));
             }
         };
+
+        fetchMessages();
+
+        const sub = supabase.channel(`party-${partyId}`)
+            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'party_messages', filter: `partyId=eq.${partyId}` }, (payload) => {
+                const msg = payload.new;
+                // Wait for potential out-of-order local appends
+                setTimeout(() => {
+                    setMessages(prev => {
+                        // Prevent duplicates if we already added it locally
+                        const exists = prev.find(m => m.id === msg.id);
+                        if (exists) return prev;
+
+                        const isMe = msg.userId === webRTCService.userId;
+                        if (!isChatOpen && !isMe) {
+                            setUnreadCount((count) => count + 1);
+                        }
+
+                        return [...prev, {
+                            user: isMe ? 'Me' : msg.userName,
+                            text: msg.text,
+                            id: msg.id
+                        }];
+                    });
+                }, 50);
+            })
+            .subscribe();
 
         const handleHistory = (history: any[]) => {
             const formatted = history.map(h => ({
                 user: h.user_id === webRTCService.userId ? 'Me' : (h.userName || h.user_name || (h.user_id ? `User ${h.user_id.substr(0, 4)}` : 'Unknown')),
-                text: h.text
+                text: h.text,
+                id: h.id || String(Math.random())
             }));
             setMessages(prev => [...prev, ...formatted]);
         };
@@ -244,8 +272,6 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
             });
         };
 
-        webRTCService.on('chat_message', handleChatMsg);
-        webRTCService.on('chat_history', handleHistory);
         webRTCService.on('participants_list', handleParticipants);
         webRTCService.on('sync_state', handleSync);
         webRTCService.on('role_update', handleRoleUpdate);
@@ -253,7 +279,7 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
         webRTCService.on('typing_stop', handleTypingStop);
 
         return () => {
-            webRTCService.off('chat_message', handleChatMsg);
+            sub.unsubscribe();
             webRTCService.off('chat_history', handleHistory);
             webRTCService.off('participants_list', handleParticipants);
             webRTCService.off('sync_state', handleSync);
@@ -273,16 +299,25 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
 
 
 
-    const sendMessage = () => {
+    const sendMessage = async () => {
         if (!messageText.trim()) return;
-        // Optimistic UI update
-        // setMessages([...messages, { user: 'Me', text: messageText }]);
 
-        // Send to backend
-        webRTCService.sendChatMessage(messageText);
+        const currentText = messageText.trim();
         setMessageText('');
         setIsTyping(false);
         webRTCService.stopTyping();
+
+        // Optimistically insert
+        const tempId = `temp-${Date.now()}`;
+        setMessages(prev => [...prev, { user: 'Me', text: currentText, id: tempId }]);
+
+        // Send to Supabase
+        await supabase.from('party_messages').insert([{
+            partyId: partyId,
+            userId: webRTCService.userId || 'unknown-uuid',
+            userName: userName,
+            text: currentText
+        }]);
     };
 
     const shareParty = async () => {
@@ -390,9 +425,14 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                         <Ionicons name="chevron-back" size={24} color="white" />
                         <Text style={styles.backText}>Leave</Text>
                     </TouchableOpacity>
-                    <View style={styles.partyIdBadge}>
-                        <Text style={styles.partyIdLabel}>Code:</Text>
-                        <Text style={styles.partyIdValue} selectable>{partyId}</Text>
+                    <View style={styles.headerRightControls}>
+                        <TouchableOpacity onPress={shareParty} style={styles.topActionButton}>
+                            <Ionicons name="share-outline" size={20} color="white" />
+                        </TouchableOpacity>
+                        <View style={styles.partyIdBadge}>
+                            <Text style={styles.partyIdLabel}>Code:</Text>
+                            <Text style={styles.partyIdValue} selectable>{partyId}</Text>
+                        </View>
                     </View>
                 </View>
             )}
@@ -543,21 +583,17 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
             {!isFullscreen && (
                 <>
                     <View style={styles.controlBar}>
-                        <TouchableOpacity style={styles.controlBtn} onPress={() => setIsChatOpen(true)}>
-                            <Ionicons name="chatbubble" size={20} color="white" style={{ marginBottom: 2 }} />
+                        <TouchableOpacity style={styles.controlBtn} onPress={() => setIsChatOpen(!isChatOpen)}>
+                            <Ionicons name="chatbubbles" size={22} color="white" />
                             <Text style={styles.controlText}>Chat</Text>
-                            {unreadCount > 0 && (
+                            {unreadCount > 0 && !isChatOpen && (
                                 <View style={styles.chatBadge}>
                                     <Text style={styles.chatBadgeText}>{unreadCount > 9 ? '9+' : unreadCount}</Text>
                                 </View>
                             )}
                         </TouchableOpacity>
-                        <TouchableOpacity style={styles.controlBtn} onPress={shareParty}>
-                            <Ionicons name="share-social" size={20} color="white" style={{ marginBottom: 2 }} />
-                            <Text style={styles.controlText}>Share</Text>
-                        </TouchableOpacity>
-                        <View style={[styles.controlBtn, { backgroundColor: isHost ? '#1B6F3A' : '#333' }]}>
-                            <Ionicons name={isHost ? 'shield-checkmark' : 'people'} size={20} color="white" style={{ marginBottom: 2 }} />
+                        <View style={[styles.controlBtn, isHost ? styles.hostBtnActive : styles.guestBtnActive]}>
+                            <Ionicons name={isHost ? 'shield-checkmark' : 'people'} size={22} color="white" />
                             <Text style={styles.controlText}>{isHost ? 'Host' : 'Guest'}</Text>
                         </View>
                     </View>
@@ -573,8 +609,8 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
 
                             {/* LOCAL USER (ME) */}
                             <View style={styles.participantTile}>
-                                <View style={[styles.cameraContainer, { backgroundColor: '#333' }]}>
-                                    {webrtcSupported && RTCViewComponent && localStream ? (
+                                <View style={styles.cameraContainer}>
+                                    {webrtcSupported && RTCViewComponent && localStream && videoEnabled ? (
                                         <RTCViewComponent
                                             streamURL={localStream.toURL()}
                                             style={styles.rtcVideo}
@@ -582,11 +618,26 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                                             mirror={true}
                                         />
                                     ) : (
-                                        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-                                            <Ionicons name="videocam-off" size={30} color="#666" />
+                                        <View style={styles.cameraPlaceholder}>
+                                            <Ionicons name="person" size={44} color="#555" />
                                         </View>
                                     )}
                                     <View style={styles.nameTag}><Text style={styles.nameText}>Me</Text></View>
+
+                                    <View style={styles.mediaControls}>
+                                        <TouchableOpacity
+                                            style={[styles.mediaBtn, !audioEnabled && styles.mediaBtnOff]}
+                                            onPress={() => setAudioEnabled(webRTCService.toggleAudio())}
+                                        >
+                                            <Ionicons name={audioEnabled ? "mic" : "mic-off"} size={18} color="white" />
+                                        </TouchableOpacity>
+                                        <TouchableOpacity
+                                            style={[styles.mediaBtn, !videoEnabled && styles.mediaBtnOff]}
+                                            onPress={() => setVideoEnabled(webRTCService.toggleVideo())}
+                                        >
+                                            <Ionicons name={videoEnabled ? "videocam" : "videocam-off"} size={18} color="white" />
+                                        </TouchableOpacity>
+                                    </View>
                                 </View>
                             </View>
 
@@ -595,7 +646,7 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                                 const stream = remoteStreams[p.userId];
                                 return (
                                     <View key={p.userId || i} style={styles.participantTile}>
-                                        <View style={[styles.cameraContainer, { backgroundColor: '#222' }]}>
+                                        <View style={styles.cameraContainer}>
                                             {webrtcSupported && RTCViewComponent && stream ? (
                                                 <RTCViewComponent
                                                     streamURL={stream.toURL()}
@@ -603,8 +654,8 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                                                     objectFit="cover"
                                                 />
                                             ) : (
-                                                 <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-                                                    <Ionicons name="person" size={30} color="#555" />
+                                                <View style={styles.cameraPlaceholder}>
+                                                    <Ionicons name="person" size={44} color="#555" />
                                                 </View>
                                             )}
                                             <View style={styles.nameTag}>
@@ -621,52 +672,61 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
                 </>
             )}
 
-            {/* Simple Chat Modal */}
-            <Modal visible={isChatOpen} animationType="slide" presentationStyle="pageSheet">
-                <View style={styles.chatContainer}>
-                    <View style={styles.chatHeader}>
-                        <Text style={styles.chatTitle}>Chat</Text>
-                        <TouchableOpacity onPress={() => setIsChatOpen(false)}><Text style={styles.closeText}>Close</Text></TouchableOpacity>
-                    </View>
-                    {Object.keys(typingUsers).length > 0 && (
-                        <Text style={styles.typingNotice}>
-                            {Object.values(typingUsers).join(', ')} {Object.keys(typingUsers).length > 1 ? 'are' : 'is'} typing...
-                        </Text>
-                    )}
-                    <ScrollView style={styles.chatList}>
-                        {messages.map((m, i) => (
-                            <View key={i} style={styles.chatMsg}>
-                                <Text style={styles.chatUser}>{m.user}</Text>
-                                <Text style={styles.chatText}>{m.text}</Text>
-                            </View>
-                        ))}
-                    </ScrollView>
-                    <View style={styles.chatInputRow}>
-                        <TextInput
-                            style={styles.chatInput}
-                            value={messageText}
-                            onChangeText={(text) => {
-                                setMessageText(text);
-                                if (!isTyping && text.trim().length > 0) {
-                                    setIsTyping(true);
-                                    webRTCService.startTyping();
-                                }
-                                if (typingStopTimeoutRef.current) {
-                                    clearTimeout(typingStopTimeoutRef.current);
-                                }
-                                typingStopTimeoutRef.current = setTimeout(() => {
-                                    setIsTyping(false);
-                                    webRTCService.stopTyping();
-                                }, 1200);
-                                if (text.trim().length === 0) {
-                                    setIsTyping(false);
-                                    webRTCService.stopTyping();
-                                }
-                            }}
-                            placeholder="Type..."
-                            placeholderTextColor="#666"
-                        />
-                        <TouchableOpacity onPress={sendMessage}><Text style={styles.sendText}>Send</Text></TouchableOpacity>
+            {/* Overlay Chat Modal */}
+            <Modal visible={isChatOpen} transparent={true} animationType="slide">
+                <View style={styles.chatOverlayWrapper}>
+                    <TouchableOpacity style={styles.chatBackdrop} activeOpacity={1} onPress={() => setIsChatOpen(false)} />
+                    <View style={styles.chatContainer}>
+                        <View style={styles.chatHeader}>
+                            <Text style={styles.chatTitle}>Live Chat</Text>
+                            <TouchableOpacity onPress={() => setIsChatOpen(false)}>
+                                <Ionicons name="close-circle" size={32} color="#4A5568" />
+                            </TouchableOpacity>
+                        </View>
+                        {Object.keys(typingUsers).length > 0 && (
+                            <Text style={styles.typingNotice}>
+                                {Object.values(typingUsers).join(', ')} {Object.keys(typingUsers).length > 1 ? 'are' : 'is'} typing...
+                            </Text>
+                        )}
+                        <ScrollView style={styles.chatList}>
+                            {messages.map((m, i) => (
+                                <View key={i} style={[styles.chatMsgWrapper, m.user === 'Me' ? styles.chatMsgWrapperMe : styles.chatMsgWrapperOther]}>
+                                    {m.user !== 'Me' && <Text style={styles.chatUser}>{m.user}</Text>}
+                                    <View style={[styles.chatBubble, m.user === 'Me' ? styles.chatBubbleMe : styles.chatBubbleOther]}>
+                                        <Text style={[styles.chatText, m.user === 'Me' ? styles.chatTextMe : styles.chatTextOther]}>{m.text}</Text>
+                                    </View>
+                                </View>
+                            ))}
+                        </ScrollView>
+                        <View style={styles.chatInputRow}>
+                            <TextInput
+                                style={styles.chatInput}
+                                value={messageText}
+                                onChangeText={(text) => {
+                                    setMessageText(text);
+                                    if (!isTyping && text.trim().length > 0) {
+                                        setIsTyping(true);
+                                        webRTCService.startTyping();
+                                    }
+                                    if (typingStopTimeoutRef.current) {
+                                        clearTimeout(typingStopTimeoutRef.current);
+                                    }
+                                    typingStopTimeoutRef.current = setTimeout(() => {
+                                        setIsTyping(false);
+                                        webRTCService.stopTyping();
+                                    }, 1200);
+                                    if (text.trim().length === 0) {
+                                        setIsTyping(false);
+                                        webRTCService.stopTyping();
+                                    }
+                                }}
+                                placeholder="Say something..."
+                                placeholderTextColor="#8F9BB3"
+                            />
+                            <TouchableOpacity onPress={sendMessage} style={styles.sendButton}>
+                                <Ionicons name="send" size={20} color="white" />
+                            </TouchableOpacity>
+                        </View>
                     </View>
                 </View>
             </Modal>
@@ -675,22 +735,24 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
 };
 
 const styles = StyleSheet.create({
-    container: { flex: 1, backgroundColor: '#000' },
+    container: { flex: 1, backgroundColor: '#05070D' },
     fullscreenContainer: { backgroundColor: 'black' },
 
     headerAbsolute: {
         position: 'absolute', top: 50, left: 20, right: 20, zIndex: 10,
         flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center'
     },
-    backButton: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.6)', padding: 8, borderRadius: 20 },
+    backButton: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.6)', padding: 8, paddingRight: 12, borderRadius: 20, borderWidth: 1, borderColor: '#333' },
     backText: { color: 'white', fontWeight: 'bold', marginLeft: 4 },
+    headerRightControls: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+    topActionButton: { backgroundColor: 'rgba(0,0,0,0.6)', padding: 10, borderRadius: 20, borderWidth: 1, borderColor: '#333' },
 
     partyIdBadge: {
         flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(52, 199, 89, 0.8)',
-        paddingVertical: 6, paddingHorizontal: 12, borderRadius: 20
+        paddingVertical: 8, paddingHorizontal: 12, borderRadius: 20
     },
-    partyIdLabel: { color: 'white', fontSize: 12, marginRight: 4, opacity: 0.8 },
-    partyIdValue: { color: 'white', fontWeight: 'bold', fontSize: 16 },
+    partyIdLabel: { color: 'white', fontSize: 13, marginRight: 4, opacity: 0.9 },
+    partyIdValue: { color: 'white', fontWeight: 'bold', fontSize: 15 },
 
     videoWrapper: { width: '100%', height: height * 0.4, backgroundColor: 'black', position: 'relative' },
     fullscreenVideo: { height: '100%' },
@@ -705,54 +767,65 @@ const styles = StyleSheet.create({
     slider: { flex: 1, marginHorizontal: 10 },
     timeText: { color: 'white', fontSize: 12, width: 40, textAlign: 'center' },
 
-    controlBar: { flexDirection: 'row', padding: 12, justifyContent: 'space-around', backgroundColor: '#111' },
-    controlBtn: { padding: 10, borderRadius: 8, backgroundColor: '#333', minWidth: 80, alignItems: 'center', justifyContent: 'center' },
-    controlText: { fontWeight: '600', color: '#fff', fontSize: 12, marginTop: 2 },
+    controlBar: { flexDirection: 'row', paddingHorizontal: 20, paddingTop: 16, paddingBottom: 8, justifyContent: 'center', gap: 16 },
+    controlBtn: { flexDirection: 'row', paddingVertical: 12, paddingHorizontal: 24, borderRadius: 100, backgroundColor: 'rgba(255,255,255,0.08)', alignItems: 'center', justifyContent: 'center', gap: 8, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
+    hostBtnActive: { backgroundColor: 'rgba(52, 199, 89, 0.2)', borderColor: 'rgba(52, 199, 89, 0.4)' },
+    guestBtnActive: { backgroundColor: 'rgba(56, 189, 248, 0.15)', borderColor: 'rgba(56, 189, 248, 0.3)' },
+    controlText: { fontWeight: '700', color: '#fff', fontSize: 15 },
     webrtcNotice: { color: '#f5c451', fontSize: 12, paddingHorizontal: 14, paddingBottom: 6 },
     chatBadge: {
-        position: 'absolute',
-        top: 4,
-        right: 6,
-        minWidth: 18,
-        height: 18,
-        borderRadius: 9,
-        backgroundColor: '#FF3B30',
-        alignItems: 'center',
-        justifyContent: 'center',
-        paddingHorizontal: 4,
+        position: 'absolute', top: -5, right: -5, minWidth: 20, height: 20, borderRadius: 10,
+        backgroundColor: '#FF3B30', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4,
+        borderWidth: 2, borderColor: '#05070D'
     },
-    chatBadgeText: { color: 'white', fontSize: 10, fontWeight: '700' },
+    chatBadgeText: { color: 'white', fontSize: 10, fontWeight: '800' },
 
-    bottomPanel: { flex: 1, padding: 16 },
-    sectionTitle: { color: 'white', fontSize: 18, fontWeight: 'bold', marginBottom: 12 },
+    bottomPanel: { flex: 1, padding: 20 },
+    sectionTitle: { color: 'white', fontSize: 22, fontWeight: '800', marginBottom: 16 },
     participantRow: {},
-    participantTile: { marginRight: 12 },
+    participantTile: { marginRight: 16 },
 
     cameraContainer: {
-        width: 100, height: 140,
-        borderRadius: 12,
+        width: 140, height: 190,
+        borderRadius: 20,
         overflow: 'hidden',
-        backgroundColor: '#333',
+        backgroundColor: '#161B22',
         justifyContent: 'center',
         alignItems: 'center',
         borderWidth: 1,
-        borderColor: '#444'
+        borderColor: '#2D3748',
+        position: 'relative',
     },
+    cameraPlaceholder: { flex: 1, justifyContent: 'center', alignItems: 'center', width: '100%', backgroundColor: '#161B22' },
     rtcVideo: { width: '100%', height: '100%' },
 
-    nameTag: { position: 'absolute', bottom: 6, left: 6, backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
-    nameText: { color: 'white', fontSize: 10, fontWeight: 'bold' },
+    mediaControls: { position: 'absolute', top: 10, right: 10, gap: 8 },
+    mediaBtn: { width: 34, height: 34, borderRadius: 17, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
+    mediaBtnOff: { backgroundColor: 'rgba(255, 59, 48, 0.8)', borderColor: '#FF3B30' },
 
-    chatContainer: { flex: 1, backgroundColor: '#1c1c1e' },
-    chatHeader: { flexDirection: 'row', justifyContent: 'space-between', padding: 16, borderBottomWidth: 1, borderBottomColor: '#333' },
-    chatTitle: { color: 'white', fontSize: 17, fontWeight: '600' },
-    typingNotice: { color: '#8EA7FF', fontSize: 12, paddingHorizontal: 16, paddingTop: 8 },
-    closeText: { color: '#007AFF', fontSize: 16 },
-    chatList: { flex: 1, padding: 16 },
-    chatMsg: { marginBottom: 16 },
-    chatUser: { color: '#888', fontSize: 12 },
-    chatText: { color: 'white', fontSize: 16 },
-    chatInputRow: { padding: 16, borderTopWidth: 1, borderTopColor: '#333', flexDirection: 'row', alignItems: 'center', marginBottom: 20 },
-    chatInput: { flex: 1, backgroundColor: '#2c2c2e', color: 'white', padding: 12, borderRadius: 20, marginRight: 10 },
-    sendText: { color: '#007AFF', fontWeight: 'bold' }
+    nameTag: { position: 'absolute', bottom: 10, left: 10, backgroundColor: 'rgba(0,0,0,0.7)', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 },
+    nameText: { color: 'white', fontSize: 12, fontWeight: '700' },
+
+    chatOverlayWrapper: { flex: 1, justifyContent: 'flex-end' },
+    chatBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.4)' },
+    chatContainer: { height: '55%', backgroundColor: '#0D1117', borderTopLeftRadius: 32, borderTopRightRadius: 32, borderWidth: 1, borderColor: '#1F2937' },
+    chatHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, borderBottomWidth: 1, borderBottomColor: '#1F2937' },
+    chatTitle: { color: 'white', fontSize: 18, fontWeight: '800' },
+    typingNotice: { color: '#38BDF8', fontSize: 12, paddingHorizontal: 20, paddingTop: 10, fontWeight: '600' },
+
+    chatList: { flex: 1, padding: 20 },
+    chatMsgWrapper: { marginBottom: 16, maxWidth: '85%' },
+    chatMsgWrapperMe: { alignSelf: 'flex-end', alignItems: 'flex-end' },
+    chatMsgWrapperOther: { alignSelf: 'flex-start', alignItems: 'flex-start' },
+    chatUser: { color: '#8B949E', fontSize: 12, marginBottom: 4, marginLeft: 2, fontWeight: '600' },
+    chatBubble: { padding: 14, borderRadius: 20 },
+    chatBubbleMe: { backgroundColor: '#34C759', borderBottomRightRadius: 4 },
+    chatBubbleOther: { backgroundColor: '#1F2937', borderBottomLeftRadius: 4 },
+    chatText: { fontSize: 15, lineHeight: 22 },
+    chatTextMe: { color: 'white', fontWeight: '500' },
+    chatTextOther: { color: '#E5E7EB', fontWeight: '500' },
+
+    chatInputRow: { padding: 16, paddingBottom: 30, borderTopWidth: 1, borderTopColor: '#1F2937', flexDirection: 'row', alignItems: 'center', backgroundColor: '#0D1117' },
+    chatInput: { flex: 1, backgroundColor: '#161B22', color: 'white', padding: 16, borderRadius: 24, fontSize: 16, borderWidth: 1, borderColor: '#2D3748', marginRight: 12 },
+    sendButton: { width: 50, height: 50, borderRadius: 25, backgroundColor: '#34C759', justifyContent: 'center', alignItems: 'center' }
 });
