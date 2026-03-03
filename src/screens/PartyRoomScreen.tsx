@@ -312,12 +312,17 @@ export const PartyRoomScreen = ({ route, navigation }: any) => {
         setMessages(prev => [...prev, { user: 'Me', text: currentText, id: tempId }]);
 
         // Send to Supabase
-        await supabase.from('party_messages').insert([{
+        const { error } = await supabase.from('party_messages').insert([{
             partyId: partyId,
             userId: webRTCService.userId || 'unknown-uuid',
             userName: userName,
             text: currentText
         }]);
+
+        if (error) {
+            console.error('Supabase Chat Insert Error:', error);
+            alert(`Chat Error: ${error.message} - Make sure you ran the SQL setup script in Supabase!`);
+        }
     };
 
     const shareParty = async () => {
